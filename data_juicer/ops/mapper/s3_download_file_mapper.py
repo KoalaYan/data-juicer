@@ -9,6 +9,7 @@ from typing import List, Union
 from loguru import logger
 
 from data_juicer.ops.base_op import OPERATORS, Mapper
+from data_juicer.utils.cache_quota import FileCacheQuota
 from data_juicer.utils.lazy_loader import LazyLoader
 from data_juicer.utils.s3_utils import get_aws_credentials
 
@@ -52,6 +53,10 @@ class S3DownloadFileMapper(Mapper):
         aoss_config_env: str = "AOSS_CONF",
         preserve_s3_paths: bool = False,
         source_field: str = None,
+        max_cache_files: int = 0,
+        max_cache_bytes: int = 0,
+        cache_quota_wait_timeout: float = 1800.0,
+        cache_quota_poll_interval: float = 1.0,
         *args,
         **kwargs,
     ):
@@ -80,6 +85,13 @@ class S3DownloadFileMapper(Mapper):
             avoids filename collisions in large datasets.
         :param source_field: Optional field used to preserve the original
             remote URLs before ``download_field`` is replaced by local paths.
+        :param max_cache_files: Hard upper bound on downloaded files waiting
+            in ``save_dir``. Zero disables the file-count bound.
+        :param max_cache_bytes: Hard upper bound on downloaded bytes waiting
+            in ``save_dir``. Zero disables the byte bound.
+        :param cache_quota_wait_timeout: Maximum time a downloader waits for a
+            downstream consumer to delete files and return cache capacity.
+        :param cache_quota_poll_interval: Cache-capacity polling interval.
         :param args: extra args
         :param kwargs: extra args
         """
@@ -119,6 +131,15 @@ class S3DownloadFileMapper(Mapper):
         self.preserve_s3_paths = preserve_s3_paths
         self.source_field = source_field
         self._thread_local = threading.local()
+        if max_cache_files < 0 or max_cache_bytes < 0:
+            raise ValueError("max_cache_files and max_cache_bytes must be non-negative")
+        if (max_cache_files or max_cache_bytes) and not self.save_dir:
+            raise ValueError("cache quota limits require save_dir")
+        self.max_cache_files = int(max_cache_files)
+        self.max_cache_bytes = int(max_cache_bytes)
+        self.cache_quota_wait_timeout = float(cache_quota_wait_timeout)
+        self.cache_quota_poll_interval = float(cache_quota_poll_interval)
+        self._cache_quota = self._create_cache_quota()
 
         # Prepare config dict for get_aws_credentials
         ds_config = {}
@@ -165,12 +186,25 @@ class S3DownloadFileMapper(Mapper):
         state = self.__dict__.copy()
         state["_s3_client"] = None
         state["_thread_local"] = None
+        state["_cache_quota"] = None
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
         self._s3_client = None
         self._thread_local = threading.local()
+        self._cache_quota = self._create_cache_quota()
+
+    def _create_cache_quota(self):
+        if not (self.max_cache_files or self.max_cache_bytes):
+            return None
+        return FileCacheQuota(
+            self.save_dir,
+            max_files=self.max_cache_files,
+            max_bytes=self.max_cache_bytes,
+            wait_timeout=self.cache_quota_wait_timeout,
+            poll_interval=self.cache_quota_poll_interval,
+        )
 
     @property
     def s3_client(self):
@@ -239,6 +273,7 @@ class S3DownloadFileMapper(Mapper):
         return osp.join(save_dir, filename)
 
     def _download_from_aoss(self, s3_url: str, save_path: str = None, return_content: bool = False):
+        reservation_owned = False
         try:
             content = self.aoss_client.get(s3_url)
             if hasattr(content, "read"):
@@ -249,14 +284,32 @@ class S3DownloadFileMapper(Mapper):
                 content = bytes(content)
 
             if save_path:
+                if self._cache_quota is not None:
+                    reservation_owned = self._cache_quota.acquire(
+                        save_path,
+                        len(content),
+                    )
+                    if not reservation_owned:
+                        return (
+                            "success",
+                            None,
+                            content if return_content else None,
+                            save_path,
+                        )
                 save_parent = osp.dirname(save_path)
                 if save_parent:
                     os.makedirs(save_parent, exist_ok=True)
                 with open(save_path, "wb") as f:
                     f.write(content)
+                    f.flush()
+                    os.fsync(f.fileno())
+                if self._cache_quota is not None:
+                    self._cache_quota.mark_ready(save_path)
 
             return "success", None, content if return_content else None, save_path
         except Exception as e:
+            if reservation_owned and self._cache_quota is not None and save_path:
+                self._cache_quota.release(save_path)
             error_msg = f"AOSS download error: {e}"
             logger.error(error_msg)
             return "failed", error_msg, None, None
@@ -275,6 +328,7 @@ class S3DownloadFileMapper(Mapper):
         if not self.s3_client:
             raise ValueError("S3 client not initialized. Please provide AWS credentials.")
 
+        reservation_owned = False
         try:
             bucket, key = self._parse_s3_url(s3_url)
 
@@ -284,8 +338,27 @@ class S3DownloadFileMapper(Mapper):
                 if save_dir:
                     os.makedirs(save_dir, exist_ok=True)
 
+                if self._cache_quota is not None:
+                    object_size = int(
+                        self.s3_client.head_object(Bucket=bucket, Key=key)[
+                            "ContentLength"
+                        ]
+                    )
+                    reservation_owned = self._cache_quota.acquire(
+                        save_path,
+                        object_size,
+                    )
+                    if not reservation_owned:
+                        content = None
+                        if return_content:
+                            with open(save_path, "rb") as f:
+                                content = f.read()
+                        return "success", None, content, save_path
+
                 # Download to file
                 self.s3_client.download_file(bucket, key, save_path)
+                if self._cache_quota is not None:
+                    self._cache_quota.mark_ready(save_path)
                 logger.debug(f"Downloaded S3 file: {s3_url} -> {save_path}")
 
                 # Read content if needed
@@ -308,10 +381,14 @@ class S3DownloadFileMapper(Mapper):
                 return "success", None, None, None
 
         except botocore_exceptions.ClientError as e:
+            if reservation_owned and self._cache_quota is not None and save_path:
+                self._cache_quota.release(save_path)
             error_msg = f"S3 download failed: {e}"
             logger.error(error_msg)
             return "failed", error_msg, None, None
         except Exception as e:
+            if reservation_owned and self._cache_quota is not None and save_path:
+                self._cache_quota.release(save_path)
             error_msg = f"S3 download error: {e}"
             logger.error(error_msg)
             return "failed", error_msg, None, None
@@ -338,6 +415,8 @@ class S3DownloadFileMapper(Mapper):
 
                             # Check if file exists and resume is enabled
                             if os.path.exists(save_path) and self.resume_download:
+                                if self._cache_quota is not None:
+                                    self._cache_quota.retain(save_path)
                                 if return_content:
                                     with open(save_path, "rb") as f:
                                         content = f.read()

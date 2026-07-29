@@ -51,6 +51,7 @@ from .image_captioning_mapper import ImageCaptioningMapper
 from .image_detection_yolo_mapper import ImageDetectionYoloMapper
 from .image_diffusion_mapper import ImageDiffusionMapper
 from .image_face_blur_mapper import ImageFaceBlurMapper
+from .image_humanaesexpert_mapper import ImageHumanAesExpertMapper
 from .image_mmpose_mapper import ImageMMPoseMapper
 from .image_portrait_quality_mapper import ImagePortraitQualityMapper
 from .image_remove_background_mapper import ImageRemoveBackgroundMapper
@@ -208,6 +209,7 @@ __all__ = [
     "ImageCaptioningMapper",
     "ImageDetectionYoloMapper",
     "ImageDiffusionMapper",
+    "ImageHumanAesExpertMapper",
     "ImageMMPoseMapper",
     "ImagePortraitQualityMapper",
     "ImageFaceBlurMapper",

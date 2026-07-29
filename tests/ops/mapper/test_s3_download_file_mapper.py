@@ -87,6 +87,32 @@ class S3DownloadFileMapperTest(DataJuicerTestCaseBase):
             with open(cache_path, "rb") as source:
                 self.assertEqual(source.read(), b"cached-image")
 
+    @patch.dict(os.environ, {"AOSS_CONF": "/private/runtime/aoss.conf"})
+    def test_aoss_download_registers_hard_cache_quota(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            op = S3DownloadFileMapper(
+                download_field="images",
+                save_dir=tmpdir,
+                preserve_s3_paths=True,
+                s3_backend="aoss",
+                resume_download=True,
+                max_cache_files=1,
+                max_cache_bytes=1024,
+            )
+            op._create_aoss_client = lambda: _FakeAOSSClient()
+            uri = "s3://infographics/a.jpg"
+            output = op.process_batched({"images": [[uri]]})
+            cache_path = output["images"][0][0]
+            self.assertTrue(os.path.isfile(cache_path))
+            self.assertTrue(
+                os.path.isfile(
+                    os.path.join(
+                        tmpdir,
+                        ".data_juicer_cache_quota.json",
+                    )
+                )
+            )
+
     @patch.dict(os.environ, {}, clear=True)
     def test_aoss_backend_requires_environment_variable(self):
         with self.assertRaisesRegex(ValueError, "AOSS_CONF"):

@@ -105,6 +105,8 @@ class MetaKeys(object):
     pose_info = "pose_info"
     # # lightweight portrait hard-quality signals and triage
     portrait_quality = "portrait_quality"
+    # # HumanAesExpert Expert Head 12-dimensional portrait aesthetics
+    humanaesexpert_expert_scores = "humanaesexpert_expert_scores"
     # # Camera Calibration Info (for DeepCalib)
     camera_calibration_deepcalib_tags = "camera_calibration_deepcalib_tags"
     # # Camera Calibration Info (for Moge-2)

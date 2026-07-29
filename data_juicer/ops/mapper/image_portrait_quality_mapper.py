@@ -7,6 +7,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from loguru import logger
 
+from data_juicer.utils.cache_quota import (
+    delete_file_and_release_cache_quota,
+)
 from data_juicer.utils.constant import Fields, MetaKeys
 from data_juicer.utils.lazy_loader import LazyLoader
 from data_juicer.utils.mm_utils import (
@@ -293,8 +296,11 @@ class ImagePortraitQualityMapper(Mapper):
                 continue
             try:
                 if os.path.isfile(absolute_path):
-                    os.remove(absolute_path)
-                    deleted.append(True)
+                    was_deleted = delete_file_and_release_cache_quota(
+                        self.local_cache_root,
+                        resolved_path,
+                    )
+                    deleted.append(was_deleted)
                 else:
                     deleted.append(False)
             except OSError as e:

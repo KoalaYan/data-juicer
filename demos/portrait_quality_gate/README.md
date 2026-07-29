@@ -122,6 +122,57 @@ For visualization, run a separate small sample with cleanup disabled. A
 full-scale output intentionally contains no durable local image path; selected
 review images should be downloaded again into a dedicated viewer cache.
 
+## Two-stage full-dataset scoring
+
+`run_stage1_portrait_quality_all.py` annotates every input row and performs no
+filtering. Its Ray JSON output is therefore 1:1 with the source JSONL, while
+`images` is restored to the original S3 URI and
+`__dj__meta__.portrait_quality` contains the hard-quality and four-level human
+presence results.
+
+```bash
+export AOSS_CONF="/path/to/private/aoss.conf"
+
+python demos/portrait_quality_gate/run_stage1_portrait_quality_all.py \
+  --input /path/to/raw.jsonl \
+  --output /path/to/stage1_portrait_quality.jsonl \
+  --cache-root /path/to/shared/afs/stage1-cache \
+  --max-cache-files 1024 \
+  --max-cache-bytes 214748364800
+```
+
+`run_stage2_humanaesexpert_12d.py` reads that output, keeps
+`portrait_clear` and `human_present` samples with `pass` or `uncertain`
+hard-quality status, downloads those images again, and runs the official
+HumanAesExpert-8B Expert Head:
+
+```bash
+python demos/portrait_quality_gate/run_stage2_humanaesexpert_12d.py \
+  --input /path/to/stage1_portrait_quality.jsonl \
+  --output /path/to/stage2_humanaesexpert_12d.jsonl \
+  --cache-root /path/to/shared/afs/stage2-cache \
+  --model-cache /path/to/huggingface-cache \
+  --max-cache-files 256 \
+  --max-cache-bytes 107374182400
+```
+
+The Expert Head record is stored in
+`__dj__meta__.humanaesexpert_expert_scores`, with the official 12 dimensions:
+facial brightness, feature clarity, skin tone, structure, contour clarity,
+facial aesthetics, outfit, body shape, looks, environment, general appearance
+aesthetics, and comprehensive aesthetics. The aggregate `score` is the
+`comprehensive_aesthetic_score`. Skin tone, body shape, and looks are retained
+as model diagnostics and must not be used directly as automatic deletion
+criteria.
+
+Both scripts use a cross-process cache quota. Download workers reserve file and
+byte capacity before writing; after scoring, the consumer deletes the local
+file and returns the reservation. When either limit is reached, new downloads
+wait while the GPU continues consuming completed items. Download batch size is
+fixed to one so a partially produced Ray batch cannot occupy the entire quota
+and deadlock itself. Duplicate S3 paths are reference-counted and are deleted
+after their final in-flight consumer.
+
 Each image receives a `__dj__meta__.portrait_quality` record with:
 
 - `status`: `pass`, `uncertain`, or `reject`;
