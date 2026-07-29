@@ -58,6 +58,8 @@ information in output records.
 `inference_batch_size` controls the largest GPU call. For a single GPU, start
 with both set to 8 and tune upward based on VRAM. Ray execution can be enabled
 with `executor_type: ray` when the runtime has Ray configured.
+The demo declares `num_gpus: 1`; remove that resource request and set
+`accelerator: cpu` only when intentionally using the slower CPU fallback.
 
 ## Image and dataset caches
 
