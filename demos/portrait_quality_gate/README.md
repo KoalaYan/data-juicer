@@ -44,6 +44,41 @@ The AOSS mapper copies original remote paths to `source_images`, replaces
 `images` with collision-safe local cache paths, and stores no AOSS credential
 information in output records.
 
+## Batch execution
+
+`image_portrait_quality_mapper` implements native `process_batched()`:
+
+- images across samples are flattened while retaining sample/image indices;
+- YOLO person and pose models each receive image lists instead of single images;
+- `inference_batch_size` bounds each model micro-batch;
+- OpenCV face detection and deterministic metrics remain per-image CPU work;
+- results are restored to the original nested image order.
+
+`batch_size` controls the Data-Juicer dataset batch, while
+`inference_batch_size` controls the largest GPU call. For a single GPU, start
+with both set to 8 and tune upward based on VRAM. Ray execution can be enabled
+with `executor_type: ray` when the runtime has Ray configured.
+
+## Image and dataset caches
+
+There are three independent caches:
+
+1. The AOSS materialization cache is `s3_download_file_mapper.save_dir`.
+   With `preserve_s3_paths: true`, an object is stored as
+   `<save_dir>/<bucket>/<key>`. `source_images` retains the original URI and
+   `images` is replaced with the local path.
+2. With `resume_download: true`, an existing local path is reused without
+   another AOSS request. This is an existence-based cache; it does not currently
+   compare an object ETag or checksum.
+3. Data-Juicer's `use_cache`/`ds_cache_dir` caches transformed dataset states
+   by input and operator fingerprint. Model weights use
+   `DATA_JUICER_MODELS_CACHE` separately.
+
+The demo uses `/tmp/data_juicer_portrait_cache` only for smoke tests. `/tmp` is
+node-local and may be cleaned after reboot or by system policy. Production
+recipes should change `save_dir` to a persistent AFS path outside the Git
+repository. Do not store AOSS credentials in that directory or in YAML.
+
 Each image receives a `__dj__meta__.portrait_quality` record with:
 
 - `status`: `pass`, `uncertain`, or `reject`;

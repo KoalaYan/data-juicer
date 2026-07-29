@@ -151,6 +151,7 @@ class ImagePortraitQualityMapper(Mapper):
     """
 
     _accelerator = "cuda"
+    _batched_op = True
 
     def __init__(
         self,
@@ -162,6 +163,7 @@ class ImagePortraitQualityMapper(Mapper):
         yolo_model_path: str = "yolo11n.pt",
         yolo_pose_model_path: str = "yolo11n-pose.pt",
         yolo_image_size: int = 640,
+        inference_batch_size: int = 16,
         person_confidence: float = 0.35,
         strong_person_confidence: float = 0.55,
         pose_confidence: float = 0.35,
@@ -193,6 +195,8 @@ class ImagePortraitQualityMapper(Mapper):
             raise ValueError("require_human=True needs at least one enabled human detector")
         if max_analysis_side < 64:
             raise ValueError("max_analysis_side must be at least 64")
+        if inference_batch_size < 1:
+            raise ValueError("inference_batch_size must be positive")
         if not 0 <= edge_margin_ratio < 0.5:
             raise ValueError("edge_margin_ratio must be in [0, 0.5)")
 
@@ -202,6 +206,7 @@ class ImagePortraitQualityMapper(Mapper):
         self.detect_pose = detect_pose
         self.require_human = require_human
         self.yolo_image_size = yolo_image_size
+        self.inference_batch_size = inference_batch_size
         self.person_confidence = person_confidence
         self.strong_person_confidence = strong_person_confidence
         self.pose_confidence = pose_confidence
@@ -252,14 +257,25 @@ class ImagePortraitQualityMapper(Mapper):
         confidences = prediction.boxes.conf.detach().cpu().numpy().tolist()
         return boxes, confidences
 
-    def _detect_poses(self, image, rank=None) -> List[Dict]:
-        model = get_model(self.pose_model_key, rank=rank, use_cuda=self.use_cuda())
-        prediction = model(
-            image,
+    def _detect_people_batch(self, images, rank=None):
+        model = get_model(self.person_model_key, rank=rank, use_cuda=self.use_cuda())
+        predictions = model(
+            images,
             imgsz=self.yolo_image_size,
-            conf=self.pose_confidence,
+            conf=self.person_confidence,
+            classes=[0],
             verbose=False,
-        )[0]
+        )
+        return [
+            (
+                prediction.boxes.xyxy.detach().cpu().numpy().tolist(),
+                prediction.boxes.conf.detach().cpu().numpy().tolist(),
+            )
+            for prediction in predictions
+        ]
+
+    @staticmethod
+    def _pose_prediction_to_records(prediction) -> List[Dict]:
         if prediction.keypoints is None:
             return []
         boxes = prediction.boxes.xyxy.detach().cpu().numpy().tolist()
@@ -287,6 +303,26 @@ class ImagePortraitQualityMapper(Mapper):
             )
         ]
 
+    def _detect_poses(self, image, rank=None) -> List[Dict]:
+        model = get_model(self.pose_model_key, rank=rank, use_cuda=self.use_cuda())
+        prediction = model(
+            image,
+            imgsz=self.yolo_image_size,
+            conf=self.pose_confidence,
+            verbose=False,
+        )[0]
+        return self._pose_prediction_to_records(prediction)
+
+    def _detect_poses_batch(self, images, rank=None):
+        model = get_model(self.pose_model_key, rank=rank, use_cuda=self.use_cuda())
+        predictions = model(
+            images,
+            imgsz=self.yolo_image_size,
+            conf=self.pose_confidence,
+            verbose=False,
+        )
+        return [self._pose_prediction_to_records(prediction) for prediction in predictions]
+
     def _detect_faces(self, image) -> List[Tuple[int, int, int, int]]:
         model = get_model(self.face_model_key)
         detections = detect_faces(
@@ -299,32 +335,39 @@ class ImagePortraitQualityMapper(Mapper):
         )
         return [(int(x), int(y), int(w), int(h)) for x, y, w, h in detections]
 
-    def _analyze_image(self, image, rank=None) -> Dict:
+    def _analyze_image(self, image, rank=None, detections=None) -> Dict:
         original_width, original_height = image.size
-        person_boxes: List[Tuple[float, float, float, float]] = []
-        person_confidences: List[float] = []
-        face_boxes: List[Tuple[int, int, int, int]] = []
-        poses: List[Dict] = []
-        detection_errors: List[str] = []
+        if detections is None:
+            person_boxes: List[Tuple[float, float, float, float]] = []
+            person_confidences: List[float] = []
+            face_boxes: List[Tuple[int, int, int, int]] = []
+            poses: List[Dict] = []
+            detection_errors: List[str] = []
 
-        if self.detect_people:
-            try:
-                person_boxes, person_confidences = self._detect_people(image, rank=rank)
-            except Exception as e:
-                detection_errors.append(f"person_detector:{type(e).__name__}")
-                logger.warning(f"Portrait person detection failed: {e}")
-        if self.detect_faces_enabled:
-            try:
-                face_boxes = self._detect_faces(image)
-            except Exception as e:
-                detection_errors.append(f"face_detector:{type(e).__name__}")
-                logger.warning(f"Portrait face detection failed: {e}")
-        if self.detect_pose:
-            try:
-                poses = self._detect_poses(image, rank=rank)
-            except Exception as e:
-                detection_errors.append(f"pose_detector:{type(e).__name__}")
-                logger.warning(f"Portrait pose detection failed: {e}")
+            if self.detect_people:
+                try:
+                    person_boxes, person_confidences = self._detect_people(image, rank=rank)
+                except Exception as e:
+                    detection_errors.append(f"person_detector:{type(e).__name__}")
+                    logger.warning(f"Portrait person detection failed: {e}")
+            if self.detect_faces_enabled:
+                try:
+                    face_boxes = self._detect_faces(image)
+                except Exception as e:
+                    detection_errors.append(f"face_detector:{type(e).__name__}")
+                    logger.warning(f"Portrait face detection failed: {e}")
+            if self.detect_pose:
+                try:
+                    poses = self._detect_poses(image, rank=rank)
+                except Exception as e:
+                    detection_errors.append(f"pose_detector:{type(e).__name__}")
+                    logger.warning(f"Portrait pose detection failed: {e}")
+        else:
+            person_boxes = detections["person_boxes"]
+            person_confidences = detections["person_confidences"]
+            face_boxes = detections["face_boxes"]
+            poses = detections["poses"]
+            detection_errors = detections["detection_errors"]
 
         resized, scale_x, scale_y = _resize_for_analysis(image, self.max_analysis_side)
         rgb = np.asarray(resized.convert("RGB"), dtype=np.uint8)
@@ -534,6 +577,61 @@ class ImagePortraitQualityMapper(Mapper):
             "pose_quality": pose_quality,
         }
 
+    def _run_batched_detectors(self, images, rank=None):
+        batch_size = len(images)
+        people = [([], []) for _ in range(batch_size)]
+        faces = [[] for _ in range(batch_size)]
+        poses = [[] for _ in range(batch_size)]
+        errors = [[] for _ in range(batch_size)]
+
+        if self.detect_people:
+            try:
+                people = self._detect_people_batch(images, rank=rank)
+            except Exception as batch_error:
+                logger.warning(f"Portrait batched person detection failed; retrying per image: {batch_error}")
+                for idx, image in enumerate(images):
+                    try:
+                        people[idx] = self._detect_people(image, rank=rank)
+                    except Exception as e:
+                        errors[idx].append(f"person_detector:{type(e).__name__}")
+                        logger.warning(f"Portrait person detection failed: {e}")
+
+        if self.detect_faces_enabled:
+            for idx, image in enumerate(images):
+                try:
+                    faces[idx] = self._detect_faces(image)
+                except Exception as e:
+                    errors[idx].append(f"face_detector:{type(e).__name__}")
+                    logger.warning(f"Portrait face detection failed: {e}")
+
+        if self.detect_pose:
+            try:
+                poses = self._detect_poses_batch(images, rank=rank)
+            except Exception as batch_error:
+                logger.warning(f"Portrait batched pose detection failed; retrying per image: {batch_error}")
+                for idx, image in enumerate(images):
+                    try:
+                        poses[idx] = self._detect_poses(image, rank=rank)
+                    except Exception as e:
+                        errors[idx].append(f"pose_detector:{type(e).__name__}")
+                        logger.warning(f"Portrait pose detection failed: {e}")
+
+        return [
+            {
+                "person_boxes": person_boxes,
+                "person_confidences": person_confidences,
+                "face_boxes": image_faces,
+                "poses": image_poses,
+                "detection_errors": image_errors,
+            }
+            for (person_boxes, person_confidences), image_faces, image_poses, image_errors in zip(
+                people,
+                faces,
+                poses,
+                errors,
+            )
+        ]
+
     def process_single(self, sample, rank=None, context=False):
         if Fields.meta not in sample or sample[Fields.meta] is None:
             sample[Fields.meta] = {}
@@ -556,3 +654,69 @@ class ImagePortraitQualityMapper(Mapper):
             self._analyze_image(images[key], rank=rank) for key in loaded_image_keys
         ]
         return sample
+
+    def process_batched(self, samples, rank=None, context=False):
+        """Score all images in a sample batch with true YOLO batch inference."""
+        if not samples:
+            return samples
+        num_samples = len(next(iter(samples.values())))
+        if Fields.meta not in samples:
+            samples[Fields.meta] = [{} for _ in range(num_samples)]
+        else:
+            samples[Fields.meta] = [
+                meta if meta is not None else {} for meta in samples[Fields.meta]
+            ]
+
+        flat_images = []
+        image_owners = []
+        for sample_idx in range(num_samples):
+            meta = samples[Fields.meta][sample_idx]
+            if self.output_key in meta:
+                continue
+            sample_images = (
+                samples[self.image_key][sample_idx]
+                if self.image_key in samples and samples[self.image_key][sample_idx]
+                else []
+            )
+            if not sample_images:
+                meta[self.output_key] = []
+                continue
+            samples, loaded_images = load_data_with_context(
+                samples,
+                context,
+                sample_images,
+                load_image,
+                mm_bytes_key=self.image_bytes_key,
+                sample_idx=sample_idx,
+            )
+            for image_idx, image_key in enumerate(sample_images):
+                flat_images.append(loaded_images[image_key])
+                image_owners.append((sample_idx, image_idx))
+
+        quality_by_sample = {}
+        for start in range(0, len(flat_images), self.inference_batch_size):
+            end = start + self.inference_batch_size
+            image_chunk = flat_images[start:end]
+            detection_chunk = self._run_batched_detectors(image_chunk, rank=rank)
+            for image, detections, (sample_idx, image_idx) in zip(
+                image_chunk,
+                detection_chunk,
+                image_owners[start:end],
+            ):
+                quality_by_sample.setdefault(sample_idx, []).append(
+                    (
+                        image_idx,
+                        self._analyze_image(
+                            image,
+                            rank=rank,
+                            detections=detections,
+                        ),
+                    )
+                )
+
+        for sample_idx, indexed_quality in quality_by_sample.items():
+            indexed_quality.sort(key=lambda item: item[0])
+            samples[Fields.meta][sample_idx][self.output_key] = [
+                quality for _, quality in indexed_quality
+            ]
+        return samples

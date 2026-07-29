@@ -1,3 +1,4 @@
+import io
 import unittest
 
 import numpy as np
@@ -6,10 +7,17 @@ from PIL import Image
 from data_juicer.ops.mapper.image_portrait_quality_mapper import (
     ImagePortraitQualityMapper,
 )
+from data_juicer.utils.constant import Fields, MetaKeys
 from data_juicer.utils.unittest_utils import DataJuicerTestCaseBase
 
 
 class ImagePortraitQualityMapperTest(DataJuicerTestCaseBase):
+
+    @staticmethod
+    def _jpeg_bytes(color):
+        buffer = io.BytesIO()
+        Image.new("RGB", (100, 100), color).save(buffer, format="JPEG")
+        return buffer.getvalue()
 
     def _rule_only_op(self, **kwargs):
         return ImagePortraitQualityMapper(
@@ -118,6 +126,41 @@ class ImagePortraitQualityMapperTest(DataJuicerTestCaseBase):
         self.assertEqual(result["human_status"], "human_uncertain")
         self.assertEqual(result["status"], "uncertain")
         self.assertIn("partial_human_or_bad_crop", result["warning_reasons"])
+
+    def test_process_batched_runs_one_detector_batch_and_preserves_order(self):
+        op = ImagePortraitQualityMapper(
+            detect_people=True,
+            detect_faces_enabled=False,
+            detect_pose=False,
+            require_human=True,
+            inference_batch_size=8,
+        )
+        calls = []
+
+        def detect_people_batch(images, rank=None):
+            calls.append(len(images))
+            return [
+                ([(30, 10, 70, 95)], [0.9]),
+                ([], []),
+            ]
+
+        op._detect_people_batch = detect_people_batch
+        samples = {
+            "text": ["first", "second"],
+            "images": [["first.jpg"], ["second.jpg"]],
+            "image_bytes": [
+                [self._jpeg_bytes((128, 128, 128))],
+                [self._jpeg_bytes((128, 128, 128))],
+            ],
+            Fields.meta: [{}, {}],
+        }
+        result = op.process_batched(samples)
+
+        self.assertEqual(calls, [2])
+        first = result[Fields.meta][0][MetaKeys.portrait_quality][0]
+        second = result[Fields.meta][1][MetaKeys.portrait_quality][0]
+        self.assertEqual(first["human_status"], "human_present")
+        self.assertEqual(second["human_status"], "no_human")
 
 
 if __name__ == "__main__":

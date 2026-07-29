@@ -25,6 +25,10 @@ process:
       aoss_config_env: AOSS_CONF
 
   - image_portrait_quality_mapper:
+      # Data-Juicer batch size and the maximum YOLO inference micro-batch.
+      # Start with 8 and increase after checking GPU memory.
+      batch_size: 8
+      inference_batch_size: 8
       detect_people: true
       detect_faces_enabled: true
       detect_pose: true

@@ -62,6 +62,31 @@ class S3DownloadFileMapperTest(DataJuicerTestCaseBase):
             self.assertEqual(output["images"], [[expected_path]])
             self.assertTrue(os.path.isfile(expected_path))
 
+    @patch.dict(os.environ, {"AOSS_CONF": "/private/runtime/aoss.conf"})
+    def test_resume_download_reuses_existing_file_without_aoss_request(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            op = S3DownloadFileMapper(
+                download_field="images",
+                save_dir=tmpdir,
+                preserve_s3_paths=True,
+                s3_backend="aoss",
+                resume_download=True,
+            )
+            uri = "s3://infographics/a/b/existing.jpg"
+            cache_path = op._get_local_save_path(uri, tmpdir)
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            with open(cache_path, "wb") as target:
+                target.write(b"cached-image")
+
+            def fail_if_called():
+                raise AssertionError("AOSS should not be called on a cache hit")
+
+            op._create_aoss_client = fail_if_called
+            output = op.process_batched({"images": [[uri]]})
+            self.assertEqual(output["images"], [[cache_path]])
+            with open(cache_path, "rb") as source:
+                self.assertEqual(source.read(), b"cached-image")
+
     @patch.dict(os.environ, {}, clear=True)
     def test_aoss_backend_requires_environment_variable(self):
         with self.assertRaisesRegex(ValueError, "AOSS_CONF"):
