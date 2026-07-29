@@ -20,6 +20,18 @@ Do not add the config file, its contents, or credentials to YAML or Git.
 The runtime environment must already provide the internal `aoss_client`
 package. Install Data-Juicer with its vision dependencies for YOLO and OpenCV.
 
+## Input schema
+
+The input JSONL should contain an `images` list of local paths or S3 URIs. The
+generic Data-Juicer formatter also requires a non-empty `text` field before it
+runs any operator. The portrait gate never consumes this field: copy the
+source caption into `text`, or use a fixed placeholder such as
+`"portrait_quality_gate"` for image-only raw data.
+
+Useful provenance fields such as `id`, `image_root`, `source_meta`,
+`source_offset`, and `conversations` are passed through and included in the
+review output when available.
+
 ## Score before filtering
 
 Edit only the input/output/cache paths in `score.yaml`, then run:

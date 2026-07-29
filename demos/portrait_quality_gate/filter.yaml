@@ -4,6 +4,7 @@ dataset_path: ./outputs/portrait-hard-quality/scored.jsonl
 export_path: ./outputs/portrait-hard-quality/selected.jsonl
 
 np: 4
+text_keys: text
 skip_op_error: false
 
 process:
