@@ -2,6 +2,9 @@
 # Replace all /path/to placeholders before running.
 project_name: portrait-hard-quality-streaming
 executor_type: ray
+# Start an in-process Ray runtime on a single development machine. Change this
+# to "auto" only when a Ray cluster has already been started externally.
+ray_address: local
 dataset_path: /path/to/input.jsonl
 export_path: /path/to/output/selected.jsonl
 

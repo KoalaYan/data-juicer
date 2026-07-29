@@ -100,6 +100,19 @@ Use `score_streaming_cleanup.yaml` for production-scale runs. It:
 - restores `images` to the original `source_images` S3 URIs before export;
 - writes `local_cache_deleted` into each image's quality record.
 
+The recipe starts a single-machine Ray runtime with `ray_address: local`.
+Change it to `auto` only when connecting to a Ray cluster that was started
+separately. In containers where Ray reports zero available CPUs, set
+`RAY_USE_MULTIPROCESSING_CPU_COUNT=1` for the process. When running directly
+from a checkout that is not installed in editable mode, put that checkout on
+`PYTHONPATH` so both the driver and Ray workers load the same operators:
+
+```bash
+PYTHONPATH="$PWD" \
+RAY_USE_MULTIPROCESSING_CPU_COUNT=1 \
+dj-process --config demos/portrait_quality_gate/score_streaming_cleanup.yaml
+```
+
 The cleanup root and S3 download `save_dir` must resolve to exactly the same
 directory. `/tmp` must not be used with a multi-node Ray cluster because it is
 node-local. If a task fails before cleanup, only in-flight batch files may
