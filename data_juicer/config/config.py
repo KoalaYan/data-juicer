@@ -858,6 +858,12 @@ def init_configs(args: Optional[List[str]] = None, which_entry: object = None, l
                     if "process" in config_data:
                         for op in config_data["process"]:
                             used_ops.add(list(op.keys())[0])
+                    from data_juicer.ops.load import (
+                        ensure_operator_registered,
+                    )
+
+                    for op_name in used_ops:
+                        ensure_operator_registered(op_name)
 
                 # Add remaining arguments
                 ops_sorted_by_types = sort_op_by_types_and_names(OPERATORS.modules.items())

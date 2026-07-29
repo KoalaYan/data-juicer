@@ -1,3 +1,4 @@
+import os
 import time
 from contextlib import contextmanager
 
@@ -14,7 +15,6 @@ def timing_context(description):
 
 # yapf: disable
 with timing_context('Importing operator modules'):
-    from . import aggregator, deduplicator, filter, grouper, mapper, pipeline, selector
     from .base_op import (
         ATTRIBUTION_FILTERS,
         NON_STATS_FILTERS,
@@ -29,7 +29,14 @@ with timing_context('Importing operator modules'):
         Pipeline,
         Selector,
     )
-    from .fused_sequential_batch_op import FusedSequentialBatchOp  # noqa: F401
+    if os.environ.get("DATA_JUICER_LAZY_OP_IMPORT", "").lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        from . import aggregator, deduplicator, filter, grouper, mapper, pipeline, selector
+        from .fused_sequential_batch_op import FusedSequentialBatchOp  # noqa: F401
     from .load import load_ops
     from .op_env import (
         OPEnvManager,

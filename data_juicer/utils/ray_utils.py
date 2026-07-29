@@ -32,6 +32,10 @@ def initialize_ray(cfg=None, force=False):
 
     # collect ray envs
     env_vars = {RAY_JOB_ENV_VAR: os.environ.get(RAY_JOB_ENV_VAR, "0")}
+    if "DATA_JUICER_LAZY_OP_IMPORT" in os.environ:
+        env_vars["DATA_JUICER_LAZY_OP_IMPORT"] = os.environ[
+            "DATA_JUICER_LAZY_OP_IMPORT"
+        ]
     for k, v in dict(os.environ).items():
         if k.startswith(SPECIAL_TOKEN_ENV_PREFIX):
             env_vars.update({k: v})

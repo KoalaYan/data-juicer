@@ -168,6 +168,59 @@ class ImageHumanAesExpertMapperTest(DataJuicerTestCaseBase):
             [None],
         )
 
+    def test_persistent_pool_scores_one_batch_and_preserves_alignment(self):
+        source = [
+            ["s3://bucket/eligible.jpg", "s3://bucket/ineligible.jpg"],
+            ["s3://bucket/second.jpg"],
+        ]
+        op = ImageHumanAesExpertMapper(
+            persistent_actor_pool=True,
+            persistent_actor_pool_size=7,
+            skip_ineligible=True,
+        )
+        observed = []
+
+        def fake_score_paths(paths):
+            observed.append(list(paths))
+            return [{"score": float(index)} for index, _ in enumerate(paths)]
+
+        op._score_paths = fake_score_paths
+        result = op.process_batched(
+            {
+                "text": ["first", "second"],
+                "images": source,
+                Fields.meta: [
+                    {
+                        MetaKeys.portrait_quality: [
+                            {"humanaesexpert_eligible": True},
+                            {"humanaesexpert_eligible": False},
+                        ]
+                    },
+                    {
+                        MetaKeys.portrait_quality: [
+                            {"humanaesexpert_eligible": True}
+                        ]
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual(
+            observed,
+            [[source[0][0], source[1][0]]],
+        )
+        first_scores = result[Fields.meta][0][
+            MetaKeys.humanaesexpert_expert_scores
+        ]
+        second_scores = result[Fields.meta][1][
+            MetaKeys.humanaesexpert_expert_scores
+        ]
+        self.assertEqual(first_scores, [{"score": 0.0}, None])
+        self.assertEqual(second_scores, [{"score": 1.0}])
+        self.assertEqual(op.accelerator, "cpu")
+        self.assertEqual(op.ray_execution_mode, "actor")
+        self.assertEqual(op.memory, 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

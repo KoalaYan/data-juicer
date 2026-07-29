@@ -342,6 +342,42 @@ batch. A moderate value such as 8–16 lets Ray dynamically distribute many
 small tasks across the seven actors, which avoids persistent imbalance when
 different source groups have different portrait hit rates.
 
+`run_fused_cluster_8h100.sh` starts one external Ray cluster and seven named,
+detached HumanAesExpert actors before the shard runner. All 10 micro-shard
+subprocesses connect to that cluster, so the model replicas are loaded once
+per launcher run rather than once per micro-shard. The shell trap stops the
+named actors and a Ray cluster that it started on success, failure, or
+interruption. It refuses to reuse an existing Ray cluster by default; set
+`PORTRAIT_ALLOW_EXISTING_RAY=1` only when the allocated node and seven free
+GPUs are exclusively owned by this job.
+
+The fused launcher also sets `DATA_JUICER_LAZY_OP_IMPORT=1`. In this opt-in
+mode Data-Juicer registers only the operator modules named in the generated
+YAML (`s3_download_file_mapper`, `image_portrait_quality_mapper`,
+`image_portrait_cache_router_mapper`, and
+`image_humanaesexpert_mapper`). General Data-Juicer commands keep the original
+eager all-operator registration behavior when this environment variable is
+absent.
+
+Inspect the warm actor pool while the job is running:
+
+```bash
+DATA_JUICER_LAZY_OP_IMPORT=1 \
+PYTHONPATH=/mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer \
+/mnt/afs/yanpeishen/.conda/envs/portrait-hae-datajuicer/bin/python \
+  /mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer/demos/portrait_quality_gate/manage_humanaesexpert_pool.py \
+  status \
+  --ray-address auto \
+  --namespace portrait-quality-gate \
+  --prefix humanaesexpert \
+  --size 7
+```
+
+Micro-shard validation and `SUCCESS` creation remain in
+`run_sharded_pipeline.py`: each 10,000-row result is normalized, row-count
+checked, and cache-usage checked before its marker is written. Keeping the Ray
+cluster alive does not weaken or coarsen this checkpoint boundary.
+
 The original two-stage scripts remain useful when a durable stage-1 checkpoint,
 independent reruns, or threshold audits are more important than avoiding a
 second S3 download.

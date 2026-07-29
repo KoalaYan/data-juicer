@@ -131,6 +131,22 @@ def main() -> None:
     parser.add_argument("--max-num", type=positive_int, default=12)
     parser.add_argument("--ray-address", default="auto")
     parser.add_argument(
+        "--persistent-actor-pool",
+        action="store_true",
+        help=(
+            "Route scoring to an already-started detached Ray actor pool "
+            "instead of loading a model in each Ray Data actor."
+        ),
+    )
+    parser.add_argument(
+        "--persistent-actor-namespace",
+        default="portrait-quality-gate",
+    )
+    parser.add_argument(
+        "--persistent-actor-prefix",
+        default="humanaesexpert",
+    )
+    parser.add_argument(
         "--allow-model-download",
         action="store_true",
         help="Allow Hugging Face network access when weights are not cached.",
@@ -225,7 +241,7 @@ def main() -> None:
                 "image_humanaesexpert_mapper": {
                     "auto_op_parallelism": False,
                     "num_proc": args.score_workers,
-                    "num_gpus": 1,
+                    "num_gpus": 0 if args.persistent_actor_pool else 1,
                     "batch_size": args.score_batch_size,
                     "model_name_or_path": args.model,
                     "model_cache_dir": str(model_cache),
@@ -236,6 +252,12 @@ def main() -> None:
                     "local_cache_root": str(cache_root),
                     "source_image_key": "source_images",
                     "skip_ineligible": True,
+                    "persistent_actor_pool": args.persistent_actor_pool,
+                    "persistent_actor_namespace": (
+                        args.persistent_actor_namespace
+                    ),
+                    "persistent_actor_prefix": args.persistent_actor_prefix,
+                    "persistent_actor_pool_size": args.score_workers,
                 }
             },
         ],
@@ -244,6 +266,7 @@ def main() -> None:
     environment = os.environ.copy()
     environment.setdefault("RAY_USE_MULTIPROCESSING_CPU_COUNT", "1")
     environment.setdefault("DATA_JUICER_MODELS_CACHE", str(model_cache))
+    environment.setdefault("DATA_JUICER_LAZY_OP_IMPORT", "1")
     existing_pythonpath = environment.get("PYTHONPATH")
     environment["PYTHONPATH"] = (
         f"{REPOSITORY}{os.pathsep}{existing_pythonpath}"

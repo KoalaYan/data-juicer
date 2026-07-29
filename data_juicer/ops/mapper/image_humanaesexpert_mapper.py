@@ -153,10 +153,19 @@ class ImageHumanAesExpertMapper(Mapper):
         allow_unsupported_transformers: bool = False,
         required_sentencepiece_version: str = "0.2.0",
         allow_unsupported_sentencepiece: bool = False,
+        persistent_actor_pool: bool = False,
+        persistent_actor_namespace: str = "portrait-quality-gate",
+        persistent_actor_prefix: str = "humanaesexpert",
+        persistent_actor_pool_size: int = 7,
         *args,
         **kwargs,
     ):
-        kwargs.setdefault("memory", "24GB")
+        if persistent_actor_pool:
+            kwargs.setdefault("memory", "1GB")
+            kwargs.setdefault("accelerator", "cpu")
+            kwargs.setdefault("ray_execution_mode", "actor")
+        else:
+            kwargs.setdefault("memory", "24GB")
         super().__init__(*args, **kwargs)
         if input_size < 64:
             raise ValueError("input_size must be at least 64")
@@ -197,14 +206,50 @@ class ImageHumanAesExpertMapper(Mapper):
         self.allow_unsupported_sentencepiece = bool(
             allow_unsupported_sentencepiece
         )
+        if persistent_actor_pool_size < 1:
+            raise ValueError("persistent_actor_pool_size must be positive")
+        self.persistent_actor_pool = bool(persistent_actor_pool)
+        self.persistent_actor_namespace = persistent_actor_namespace
+        self.persistent_actor_prefix = persistent_actor_prefix
+        self.persistent_actor_pool_size = int(persistent_actor_pool_size)
         self._model = None
         self._tokenizer = None
+        self._persistent_handles = None
 
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_model"] = None
         state["_tokenizer"] = None
+        state["_persistent_handles"] = None
         return state
+
+    def _get_persistent_handles(self):
+        if self._persistent_handles is None:
+            import ray
+
+            from data_juicer.utils.humanaesexpert_ray_pool import (
+                get_pool_handles,
+            )
+
+            self._persistent_handles = get_pool_handles(
+                ray,
+                self.persistent_actor_namespace,
+                self.persistent_actor_prefix,
+                self.persistent_actor_pool_size,
+            )
+        return self._persistent_handles
+
+    def _score_paths(self, paths: Sequence[str]) -> List[Dict]:
+        if not self.persistent_actor_pool:
+            return [self._score_image(path) for path in paths]
+        import ray
+
+        handles = self._get_persistent_handles()
+        references = [
+            handles[index % len(handles)].score_image.remote(path)
+            for index, path in enumerate(paths)
+        ]
+        return ray.get(references)
 
     @staticmethod
     def _validate_cache_root(cache_root: str) -> str:
@@ -406,7 +451,7 @@ class ImageHumanAesExpertMapper(Mapper):
             if not eligible:
                 scores.append(None)
                 continue
-            score = self._score_image(local_path)
+            score = self._score_paths([local_path])[0]
             if self.delete_local_cache_after_processing:
                 score["local_cache_deleted"] = self._delete_cached_path(
                     local_path
@@ -430,6 +475,11 @@ class ImageHumanAesExpertMapper(Mapper):
                 meta if meta is not None else {}
                 for meta in samples[Fields.meta]
             ]
+        if self.persistent_actor_pool:
+            return self._process_batched_with_persistent_pool(
+                samples,
+                sample_count,
+            )
         for sample_index in range(sample_count):
             sample = {
                 key: values[sample_index]
@@ -440,4 +490,78 @@ class ImageHumanAesExpertMapper(Mapper):
                 if key not in samples:
                     samples[key] = [None] * sample_count
                 samples[key][sample_index] = value
+        return samples
+
+    def _process_batched_with_persistent_pool(self, samples, sample_count):
+        pending = []
+        prepared = []
+        for sample_index in range(sample_count):
+            meta = samples[Fields.meta][sample_index]
+            if self.output_key in meta:
+                prepared.append(None)
+                continue
+            local_paths = samples.get(self.image_key, [None] * sample_count)[
+                sample_index
+            ] or []
+            if not isinstance(local_paths, list):
+                local_paths = [local_paths]
+            source_paths = samples.get(
+                self.source_image_key,
+                [None] * sample_count,
+            )[sample_index] or []
+            if not isinstance(source_paths, list):
+                source_paths = [source_paths]
+            if self.delete_local_cache_after_processing and len(
+                source_paths
+            ) != len(local_paths):
+                raise ValueError(
+                    "Source image paths and local cached image paths must "
+                    "have the same length before cleanup"
+                )
+            quality_records = meta.get(MetaKeys.portrait_quality) or []
+            if self.skip_ineligible and len(quality_records) != len(
+                local_paths
+            ):
+                raise ValueError(
+                    "Portrait-quality records and image paths must have the "
+                    "same length when skip_ineligible=True"
+                )
+            scores = [None] * len(local_paths)
+            prepared.append((local_paths, source_paths, scores))
+            for image_index, local_path in enumerate(local_paths):
+                eligible = (
+                    not self.skip_ineligible
+                    or bool(
+                        quality_records[image_index].get(
+                            self.eligibility_key
+                        )
+                    )
+                )
+                if eligible:
+                    pending.append(
+                        (sample_index, image_index, local_path)
+                    )
+
+        score_records = self._score_paths(
+            [item[2] for item in pending]
+        )
+        for (sample_index, image_index, local_path), score in zip(
+            pending,
+            score_records,
+        ):
+            if self.delete_local_cache_after_processing:
+                score["local_cache_deleted"] = self._delete_cached_path(
+                    local_path
+                )
+            prepared[sample_index][2][image_index] = score
+
+        for sample_index, item in enumerate(prepared):
+            if item is None:
+                continue
+            _, source_paths, scores = item
+            samples[Fields.meta][sample_index][self.output_key] = scores
+            if self.delete_local_cache_after_processing:
+                samples[self.image_key][sample_index] = copy.deepcopy(
+                    source_paths
+                )
         return samples
