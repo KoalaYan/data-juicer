@@ -53,6 +53,9 @@ from .image_diffusion_mapper import ImageDiffusionMapper
 from .image_face_blur_mapper import ImageFaceBlurMapper
 from .image_humanaesexpert_mapper import ImageHumanAesExpertMapper
 from .image_mmpose_mapper import ImageMMPoseMapper
+from .image_portrait_cache_router_mapper import (
+    ImagePortraitCacheRouterMapper,
+)
 from .image_portrait_quality_mapper import ImagePortraitQualityMapper
 from .image_remove_background_mapper import ImageRemoveBackgroundMapper
 from .image_sam_3d_body_mapper import ImageSAM3DBodyMapper

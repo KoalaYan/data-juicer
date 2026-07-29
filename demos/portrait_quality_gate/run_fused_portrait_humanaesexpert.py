@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Filter portrait classes and run HumanAesExpert Expert Head 12D scoring."""
+"""Run one-download portrait triage and HumanAesExpert scoring on Ray."""
 
 from __future__ import annotations
 
@@ -25,6 +25,13 @@ def positive_int(value: str) -> int:
     return result
 
 
+def gpu_fraction(value: str) -> float:
+    result = float(value)
+    if not 0 < result <= 1:
+        raise argparse.ArgumentTypeError("value must be in (0, 1]")
+    return result
+
+
 def safe_cache_root(path: Path) -> Path:
     resolved = path.expanduser().resolve()
     if resolved in {Path("/"), Path.home().resolve()}:
@@ -33,53 +40,65 @@ def safe_cache_root(path: Path) -> Path:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--input",
-        required=True,
-        type=Path,
-        help="Stage-1 output containing portrait_quality metadata.",
+    parser = argparse.ArgumentParser(
+        description=(
+            "Download each image once, run portrait triage, immediately "
+            "release ineligible cache files, and score eligible images on a "
+            "persistent HumanAesExpert GPU actor pool."
+        )
     )
+    parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--cache-root", required=True, type=Path)
     parser.add_argument("--model", default="KlingTeam/HumanAesExpert-8B")
     parser.add_argument("--model-cache", required=True, type=Path)
-    parser.add_argument("--max-cache-files", type=positive_int, default=256)
+    parser.add_argument("--max-cache-files", type=positive_int, default=2048)
     parser.add_argument(
         "--max-cache-bytes",
         type=positive_int,
-        default=100 * 1024**3,
-        help="Hard cache byte cap; default: 100 GiB.",
+        default=200 * 1024**3,
+        help="Hard cache byte cap; default: 200 GiB.",
     )
-    parser.add_argument("--download-workers", type=positive_int, default=4)
+    parser.add_argument("--download-workers", type=positive_int, default=16)
+    parser.add_argument("--download-concurrency", type=positive_int, default=8)
+    parser.add_argument("--quality-workers", type=positive_int, default=4)
     parser.add_argument(
-        "--download-batch-size",
-        type=int,
-        choices=[1],
-        default=1,
+        "--quality-gpus-per-worker",
+        type=gpu_fraction,
+        default=0.25,
         help=(
-            "Must remain 1 with a hard quota so a partially downloaded Ray "
-            "batch cannot hold all capacity while waiting for itself."
+            "Ray GPU reservation per lightweight YOLO actor. Defaults to "
+            "four actors sharing one H100 in total."
         ),
     )
-    parser.add_argument("--download-concurrency", type=positive_int, default=8)
-    parser.add_argument("--score-batch-size", type=positive_int, default=4)
-    parser.add_argument("--score-workers", type=positive_int, default=1)
+    parser.add_argument("--quality-batch-size", type=positive_int, default=64)
+    parser.add_argument("--router-workers", type=positive_int, default=16)
+    parser.add_argument("--router-batch-size", type=positive_int, default=128)
+    parser.add_argument(
+        "--score-workers",
+        type=positive_int,
+        default=7,
+        help=(
+            "Persistent HumanAesExpert actors. The 8-H100 default reserves "
+            "seven cards for scoring and one card for lightweight triage."
+        ),
+    )
+    parser.add_argument(
+        "--score-batch-size",
+        type=positive_int,
+        default=16,
+        help=(
+            "Ray scheduling batch, not a native multi-image model batch. "
+            "Smaller values improve load balancing when hit rates vary."
+        ),
+    )
     parser.add_argument("--input-size", type=positive_int, default=448)
     parser.add_argument("--max-num", type=positive_int, default=12)
-    parser.add_argument("--ray-address", default="local")
+    parser.add_argument("--ray-address", default="auto")
     parser.add_argument(
         "--allow-model-download",
         action="store_true",
         help="Allow Hugging Face network access when weights are not cached.",
-    )
-    parser.add_argument(
-        "--exclude-hard-rejects",
-        action="store_true",
-        help=(
-            "Additionally exclude hard-quality reject rows. By default the "
-            "selection follows only the two requested human-status classes."
-        ),
     )
     args = parser.parse_args()
 
@@ -100,13 +119,8 @@ def main() -> None:
         max_bytes=args.max_cache_bytes,
     ).prepare_for_new_run()
 
-    hard_statuses = (
-        ["pass", "uncertain"]
-        if args.exclude_hard_rejects
-        else ["pass", "uncertain", "reject"]
-    )
     config = {
-        "project_name": "portrait-humanaesexpert-stage2",
+        "project_name": "portrait-humanaesexpert-fused",
         "executor_type": "ray",
         "ray_address": args.ray_address,
         "dataset_path": str(input_path),
@@ -119,17 +133,6 @@ def main() -> None:
         "use_cache": False,
         "process": [
             {
-                "image_portrait_quality_filter": {
-                    "keep_statuses": hard_statuses,
-                    "keep_human_statuses": [
-                        "portrait_clear",
-                        "human_present",
-                    ],
-                    "any_or_all": "all",
-                    "keep_missing": False,
-                }
-            },
-            {
                 "s3_download_file_mapper": {
                     "download_field": "images",
                     "save_dir": str(cache_root),
@@ -140,17 +143,48 @@ def main() -> None:
                     "aoss_config_env": "AOSS_CONF",
                     "auto_op_parallelism": False,
                     "num_proc": args.download_workers,
-                    "batch_size": args.download_batch_size,
+                    "batch_size": 1,
                     "max_concurrent": args.download_concurrency,
                     "max_cache_files": args.max_cache_files,
                     "max_cache_bytes": args.max_cache_bytes,
                 }
             },
             {
+                "image_portrait_quality_mapper": {
+                    "auto_op_parallelism": False,
+                    "num_proc": args.quality_workers,
+                    "num_gpus": args.quality_gpus_per_worker,
+                    "batch_size": args.quality_batch_size,
+                    "inference_batch_size": args.quality_batch_size,
+                    "delete_local_cache_after_processing": False,
+                    "detect_people": True,
+                    "detect_faces_enabled": True,
+                    "detect_pose": True,
+                    "require_human": True,
+                    "yolo_model_path": "yolo11n.pt",
+                    "yolo_pose_model_path": "yolo11n-pose.pt",
+                    "max_analysis_side": 1024,
+                    "min_sharpness_score": 0.0,
+                }
+            },
+            {
+                "image_portrait_cache_router_mapper": {
+                    "auto_op_parallelism": False,
+                    "num_proc": args.router_workers,
+                    "batch_size": args.router_batch_size,
+                    "keep_human_statuses": [
+                        "portrait_clear",
+                        "human_present",
+                    ],
+                    "local_cache_root": str(cache_root),
+                    "source_image_key": "source_images",
+                }
+            },
+            {
                 "image_humanaesexpert_mapper": {
-                    "num_gpus": 1,
                     "auto_op_parallelism": False,
                     "num_proc": args.score_workers,
+                    "num_gpus": 1,
                     "batch_size": args.score_batch_size,
                     "model_name_or_path": args.model,
                     "model_cache_dir": str(model_cache),
@@ -160,6 +194,7 @@ def main() -> None:
                     "delete_local_cache_after_processing": True,
                     "local_cache_root": str(cache_root),
                     "source_image_key": "source_images",
+                    "skip_ineligible": True,
                 }
             },
         ],
@@ -177,7 +212,7 @@ def main() -> None:
     with tempfile.NamedTemporaryFile(
         mode="w",
         suffix=".yaml",
-        prefix="portrait-stage2-",
+        prefix="portrait-fused-",
         encoding="utf-8",
     ) as config_file:
         yaml.safe_dump(config, config_file, allow_unicode=True, sort_keys=False)

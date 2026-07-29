@@ -272,8 +272,16 @@ class S3DownloadFileMapper(Mapper):
             filename = hashlib.sha256(s3_url.encode("utf-8")).hexdigest()
         return osp.join(save_dir, filename)
 
+    @staticmethod
+    def _temporary_save_path(save_path: str) -> str:
+        return (
+            f"{save_path}.part.{os.getpid()}."
+            f"{threading.get_ident()}"
+        )
+
     def _download_from_aoss(self, s3_url: str, save_path: str = None, return_content: bool = False):
         reservation_owned = False
+        temporary_path = None
         try:
             content = self.aoss_client.get(s3_url)
             if hasattr(content, "read"):
@@ -299,15 +307,20 @@ class S3DownloadFileMapper(Mapper):
                 save_parent = osp.dirname(save_path)
                 if save_parent:
                     os.makedirs(save_parent, exist_ok=True)
-                with open(save_path, "wb") as f:
+                temporary_path = self._temporary_save_path(save_path)
+                with open(temporary_path, "wb") as f:
                     f.write(content)
                     f.flush()
                     os.fsync(f.fileno())
+                os.replace(temporary_path, save_path)
+                temporary_path = None
                 if self._cache_quota is not None:
                     self._cache_quota.mark_ready(save_path)
 
             return "success", None, content if return_content else None, save_path
         except Exception as e:
+            if temporary_path and os.path.isfile(temporary_path):
+                os.remove(temporary_path)
             if reservation_owned and self._cache_quota is not None and save_path:
                 self._cache_quota.release(save_path)
             error_msg = f"AOSS download error: {e}"
@@ -329,6 +342,7 @@ class S3DownloadFileMapper(Mapper):
             raise ValueError("S3 client not initialized. Please provide AWS credentials.")
 
         reservation_owned = False
+        temporary_path = None
         try:
             bucket, key = self._parse_s3_url(s3_url)
 
@@ -355,8 +369,12 @@ class S3DownloadFileMapper(Mapper):
                                 content = f.read()
                         return "success", None, content, save_path
 
-                # Download to file
-                self.s3_client.download_file(bucket, key, save_path)
+                # Download to a private temporary file and atomically publish
+                # it. Duplicate consumers never observe a partial image.
+                temporary_path = self._temporary_save_path(save_path)
+                self.s3_client.download_file(bucket, key, temporary_path)
+                os.replace(temporary_path, save_path)
+                temporary_path = None
                 if self._cache_quota is not None:
                     self._cache_quota.mark_ready(save_path)
                 logger.debug(f"Downloaded S3 file: {s3_url} -> {save_path}")
@@ -381,12 +399,16 @@ class S3DownloadFileMapper(Mapper):
                 return "success", None, None, None
 
         except botocore_exceptions.ClientError as e:
+            if temporary_path and os.path.isfile(temporary_path):
+                os.remove(temporary_path)
             if reservation_owned and self._cache_quota is not None and save_path:
                 self._cache_quota.release(save_path)
             error_msg = f"S3 download failed: {e}"
             logger.error(error_msg)
             return "failed", error_msg, None, None
         except Exception as e:
+            if temporary_path and os.path.isfile(temporary_path):
+                os.remove(temporary_path)
             if reservation_owned and self._cache_quota is not None and save_path:
                 self._cache_quota.release(save_path)
             error_msg = f"S3 download error: {e}"

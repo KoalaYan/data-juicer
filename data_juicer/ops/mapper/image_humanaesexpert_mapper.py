@@ -19,6 +19,7 @@ from ..base_op import OPERATORS, TAGGING_OPS, UNFORKABLE, Mapper
 
 torch = LazyLoader("torch")
 transformers = LazyLoader("transformers")
+sentencepiece = LazyLoader("sentencepiece")
 
 OP_NAME = "image_humanaesexpert_mapper"
 IMAGENET_MEAN = np.asarray((0.485, 0.456, 0.406), dtype=np.float32)
@@ -146,6 +147,12 @@ class ImageHumanAesExpertMapper(Mapper):
         delete_local_cache_after_processing: bool = False,
         local_cache_root: str = "",
         source_image_key: str = "source_images",
+        eligibility_key: str = "humanaesexpert_eligible",
+        skip_ineligible: bool = False,
+        required_transformers_version: str = "4.44.2",
+        allow_unsupported_transformers: bool = False,
+        required_sentencepiece_version: str = "0.2.0",
+        allow_unsupported_sentencepiece: bool = False,
         *args,
         **kwargs,
     ):
@@ -178,6 +185,18 @@ class ImageHumanAesExpertMapper(Mapper):
             else ""
         )
         self.source_image_key = source_image_key
+        self.eligibility_key = eligibility_key
+        self.skip_ineligible = bool(skip_ineligible)
+        self.required_transformers_version = required_transformers_version
+        self.allow_unsupported_transformers = bool(
+            allow_unsupported_transformers
+        )
+        self.required_sentencepiece_version = (
+            required_sentencepiece_version
+        )
+        self.allow_unsupported_sentencepiece = bool(
+            allow_unsupported_sentencepiece
+        )
         self._model = None
         self._tokenizer = None
 
@@ -203,6 +222,32 @@ class ImageHumanAesExpertMapper(Mapper):
             return self._model, self._tokenizer
         if not torch.cuda.is_available():
             raise RuntimeError("HumanAesExpert-8B Expert Head requires CUDA")
+        installed_version = transformers.__version__.split("+", 1)[0]
+        if (
+            self.required_transformers_version
+            and installed_version != self.required_transformers_version
+            and not self.allow_unsupported_transformers
+        ):
+            raise RuntimeError(
+                "HumanAesExpert requires transformers=="
+                f"{self.required_transformers_version}; found "
+                f"{installed_version}. Use a dedicated pipeline environment "
+                "or explicitly set allow_unsupported_transformers=True after "
+                "validating the model."
+            )
+        installed_sentencepiece = sentencepiece.__version__.split("+", 1)[0]
+        if (
+            self.required_sentencepiece_version
+            and installed_sentencepiece
+            != self.required_sentencepiece_version
+            and not self.allow_unsupported_sentencepiece
+        ):
+            raise RuntimeError(
+                "HumanAesExpert tokenizer requires sentencepiece=="
+                f"{self.required_sentencepiece_version}; found "
+                f"{installed_sentencepiece}. A newer release can fail with "
+                "'piece must not include null character'."
+            )
         cache_dir = self.model_cache_dir or None
         self._model = (
             transformers.AutoModel.from_pretrained(
@@ -257,11 +302,14 @@ class ImageHumanAesExpertMapper(Mapper):
                 pixel_values,
             )
         values = score_tensor.detach().float().cpu().reshape(-1).tolist()
-        return self._build_score_record(
+        record = self._build_score_record(
             values,
             official_mapping,
             int(pixel_values.shape[0]),
         )
+        record["transformers_version"] = transformers.__version__
+        record["sentencepiece_version"] = sentencepiece.__version__
+        return record
 
     def _build_score_record(
         self,
@@ -339,8 +387,25 @@ class ImageHumanAesExpertMapper(Mapper):
                 "Source image paths and local cached image paths must have "
                 "the same length before cleanup"
             )
+        quality_records = (
+            sample[Fields.meta].get(MetaKeys.portrait_quality) or []
+        )
+        if self.skip_ineligible and len(quality_records) != len(local_paths):
+            raise ValueError(
+                "Portrait-quality records and image paths must have the same "
+                "length when skip_ineligible=True"
+            )
         scores = []
-        for local_path in local_paths:
+        for image_index, local_path in enumerate(local_paths):
+            eligible = (
+                not self.skip_ineligible
+                or bool(
+                    quality_records[image_index].get(self.eligibility_key)
+                )
+            )
+            if not eligible:
+                scores.append(None)
+                continue
             score = self._score_image(local_path)
             if self.delete_local_cache_after_processing:
                 score["local_cache_deleted"] = self._delete_cached_path(

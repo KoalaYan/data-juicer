@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from contextlib import contextmanager
@@ -21,6 +22,7 @@ import fcntl
 _STATE_NAME = ".data_juicer_cache_quota.json"
 _LOCK_NAME = ".data_juicer_cache_quota.lock"
 _CONTROL_NAMES = {_STATE_NAME, _LOCK_NAME}
+_PARTIAL_FILE_PATTERN = re.compile(r"\.part\.\d+\.\d+$")
 
 
 class FileCacheQuota:
@@ -136,6 +138,27 @@ class FileCacheQuota:
             return False
         return True
 
+    def _evict_unreferenced(
+        self,
+        entries: Dict[str, dict],
+        size: int,
+    ) -> None:
+        candidates = sorted(
+            (
+                (path, entry)
+                for path, entry in entries.items()
+                if int(entry.get("references", 0)) <= 0
+                and entry.get("state") == "ready"
+            ),
+            key=lambda item: float(item[1].get("updated_at", 0.0)),
+        )
+        for path, _ in candidates:
+            if self._has_capacity(entries, size):
+                break
+            if os.path.isfile(path) and not os.path.islink(path):
+                os.remove(path)
+            entries.pop(path, None)
+
     def acquire(self, path: str, size: int) -> bool:
         """Reserve capacity for ``path``.
 
@@ -168,6 +191,7 @@ class FileCacheQuota:
                     }
                     self._write_state(state)
                     return False
+                self._evict_unreferenced(state["entries"], size)
                 if entry is None and self._has_capacity(state["entries"], size):
                     state["entries"][path] = {
                         "bytes": int(size),
@@ -246,6 +270,55 @@ class FileCacheQuota:
             state["entries"].pop(path, None)
             self._write_state(state)
             return deleted
+
+    def snapshot(self) -> dict:
+        """Return reconciled quota usage for diagnostics and tests."""
+        with self._locked():
+            state = self._load_state()
+            self._reconcile(state)
+            self._write_state(state)
+            entries = state["entries"]
+            return {
+                "files": len(entries),
+                "bytes": sum(
+                    int(entry.get("bytes", 0))
+                    for entry in entries.values()
+                ),
+                "references": sum(
+                    int(entry.get("references", 0))
+                    for entry in entries.values()
+                ),
+            }
+
+    def prepare_for_new_run(self) -> dict:
+        """Reset stale consumers for an exclusively owned cache directory.
+
+        Complete files remain available for ``resume_download`` but start with
+        zero references and can be evicted under quota pressure. Private
+        temporary files left by an interrupted downloader are removed.
+        Call this once in the driver before starting any workers.
+        """
+        with self._locked():
+            state = self._load_state()
+            for directory, _, filenames in os.walk(self.cache_root):
+                for filename in filenames:
+                    if not _PARTIAL_FILE_PATTERN.search(filename):
+                        continue
+                    path = os.path.join(directory, filename)
+                    if os.path.isfile(path) and not os.path.islink(path):
+                        os.remove(path)
+            self._reconcile(state)
+            for entry in state["entries"].values():
+                entry["references"] = 0
+                entry["updated_at"] = time.time()
+            self._write_state(state)
+            return {
+                "files": len(state["entries"]),
+                "bytes": sum(
+                    int(entry.get("bytes", 0))
+                    for entry in state["entries"].values()
+                ),
+            }
 
 
 def release_file_cache_quota(cache_root: str, path: str) -> None:

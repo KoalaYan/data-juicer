@@ -2,9 +2,12 @@ import io
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from PIL import Image
 
+import data_juicer.ops.mapper.image_humanaesexpert_mapper as hae_module
 from data_juicer.ops.mapper.image_humanaesexpert_mapper import (
     EXPERT_DIMENSIONS,
     ImageHumanAesExpertMapper,
@@ -43,6 +46,46 @@ class ImageHumanAesExpertMapperTest(DataJuicerTestCaseBase):
         mapping["Facial Brightness"] += 1
         with self.assertRaises(RuntimeError):
             op._build_score_record(values, mapping, tile_count=5)
+
+    def test_model_load_rejects_unsupported_transformers(self):
+        fake_torch = SimpleNamespace(
+            cuda=SimpleNamespace(is_available=lambda: True)
+        )
+        fake_transformers = SimpleNamespace(__version__="4.57.1")
+        op = ImageHumanAesExpertMapper()
+        with (
+            patch.object(hae_module, "torch", fake_torch),
+            patch.object(
+                hae_module,
+                "transformers",
+                fake_transformers,
+            ),
+            self.assertRaisesRegex(RuntimeError, "4.44.2"),
+        ):
+            op._load_model()
+
+    def test_model_load_rejects_unsupported_sentencepiece(self):
+        fake_torch = SimpleNamespace(
+            cuda=SimpleNamespace(is_available=lambda: True)
+        )
+        fake_transformers = SimpleNamespace(__version__="4.44.2")
+        fake_sentencepiece = SimpleNamespace(__version__="0.2.2")
+        op = ImageHumanAesExpertMapper()
+        with (
+            patch.object(hae_module, "torch", fake_torch),
+            patch.object(
+                hae_module,
+                "transformers",
+                fake_transformers,
+            ),
+            patch.object(
+                hae_module,
+                "sentencepiece",
+                fake_sentencepiece,
+            ),
+            self.assertRaisesRegex(RuntimeError, "sentencepiece==0.2.0"),
+        ):
+            op._load_model()
 
     def test_process_batched_writes_scores_deletes_cache_and_restores_uri(self):
         with tempfile.TemporaryDirectory() as cache_root:
@@ -88,6 +131,42 @@ class ImageHumanAesExpertMapperTest(DataJuicerTestCaseBase):
             ][0]
             self.assertTrue(score["local_cache_deleted"])
             self.assertEqual(score["score"], 0.8)
+
+    def test_process_batched_skips_ineligible_without_loading_model(self):
+        source = [["s3://bucket/no-human.jpg"]]
+        op = ImageHumanAesExpertMapper(
+            skip_ineligible=True,
+            delete_local_cache_after_processing=True,
+            local_cache_root=tempfile.gettempdir(),
+            source_image_key="source_images",
+        )
+        op._score_image = lambda path: self.fail(
+            "ineligible image must not be scored"
+        )
+        result = op.process_batched(
+            {
+                "text": ["empty"],
+                "images": source.copy(),
+                "source_images": source,
+                Fields.meta: [
+                    {
+                        MetaKeys.portrait_quality: [
+                            {
+                                "human_status": "no_human",
+                                "humanaesexpert_eligible": False,
+                            }
+                        ]
+                    }
+                ],
+            }
+        )
+        self.assertEqual(result["images"], source)
+        self.assertEqual(
+            result[Fields.meta][0][
+                MetaKeys.humanaesexpert_expert_scores
+            ],
+            [None],
+        )
 
 
 if __name__ == "__main__":

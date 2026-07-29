@@ -44,6 +44,33 @@ class FileCacheQuotaTest(unittest.TestCase):
             self.assertTrue(quota.delete_after_consume(path))
             self.assertFalse(os.path.exists(path))
 
+    def test_new_run_reuses_or_evicts_zero_reference_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            first = os.path.join(root, "first.jpg")
+            second = os.path.join(root, "second.jpg")
+            partial = f"{first}.part.123.456"
+            quota = FileCacheQuota(root, max_files=1)
+            self.assertTrue(quota.acquire(first, 3))
+            with open(first, "wb") as output:
+                output.write(b"abc")
+            quota.mark_ready(first)
+            with open(partial, "wb") as output:
+                output.write(b"partial")
+
+            prepared = quota.prepare_for_new_run()
+            self.assertEqual(prepared["files"], 1)
+            self.assertFalse(os.path.exists(partial))
+            self.assertFalse(quota.acquire(first, 3))
+            self.assertTrue(quota.delete_after_consume(first))
+
+            self.assertTrue(quota.acquire(first, 3))
+            with open(first, "wb") as output:
+                output.write(b"abc")
+            quota.mark_ready(first)
+            quota.prepare_for_new_run()
+            self.assertTrue(quota.acquire(second, 3))
+            self.assertFalse(os.path.exists(first))
+
 
 if __name__ == "__main__":
     unittest.main()

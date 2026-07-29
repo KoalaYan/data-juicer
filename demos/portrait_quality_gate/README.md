@@ -137,14 +137,16 @@ python demos/portrait_quality_gate/run_stage1_portrait_quality_all.py \
   --input /path/to/raw.jsonl \
   --output /path/to/stage1_portrait_quality.jsonl \
   --cache-root /path/to/shared/afs/stage1-cache \
+  --ray-address auto \
   --max-cache-files 1024 \
   --max-cache-bytes 214748364800
 ```
 
 `run_stage2_humanaesexpert_12d.py` reads that output, keeps
-`portrait_clear` and `human_present` samples with `pass` or `uncertain`
-hard-quality status, downloads those images again, and runs the official
-HumanAesExpert-8B Expert Head:
+`portrait_clear` and `human_present` samples, downloads those images again,
+and runs the official HumanAesExpert-8B Expert Head. Add
+`--exclude-hard-rejects` only when the second stage should also discard the
+first-stage hard-quality `reject` rows:
 
 ```bash
 python demos/portrait_quality_gate/run_stage2_humanaesexpert_12d.py \
@@ -152,6 +154,8 @@ python demos/portrait_quality_gate/run_stage2_humanaesexpert_12d.py \
   --output /path/to/stage2_humanaesexpert_12d.jsonl \
   --cache-root /path/to/shared/afs/stage2-cache \
   --model-cache /path/to/huggingface-cache \
+  --ray-address auto \
+  --score-workers 8 \
   --max-cache-files 256 \
   --max-cache-bytes 107374182400
 ```
@@ -172,6 +176,66 @@ wait while the GPU continues consuming completed items. Download batch size is
 fixed to one so a partially produced Ray batch cannot occupy the entire quota
 and deadlock itself. Duplicate S3 paths are reference-counted and are deleted
 after their final in-flight consumer.
+
+## One-download fused mode on 8 H100s
+
+Run this pipeline in a dedicated environment with
+`transformers==4.44.2`, `accelerate==0.33.0`, and
+`sentencepiece==0.2.0`, as required by the tested HumanAesExpert model stack.
+SentencePiece 0.2.2 fails to load this tokenizer vocabulary. The
+repository's general all-operator dependency set currently pins a newer
+Transformers release, so do not install that full extra into this environment.
+A practical cluster setup is to clone the existing Data-Juicer environment,
+pin `transformers==4.44.2` and `accelerate==0.33.0`, and verify that Ray,
+PyArrow, Ultralytics, the internal AOSS client, Torch, and Torchvision remain
+importable on every node. The operator fails early on a version mismatch
+instead of producing unverified scores.
+
+For the full run, the recommended high-throughput mode is a bounded fused
+pipeline:
+
+```bash
+python demos/portrait_quality_gate/run_fused_portrait_humanaesexpert.py \
+  --input /path/to/raw.jsonl \
+  --output /path/to/portrait_quality_and_expert12d.jsonl \
+  --cache-root /path/to/shared/afs/fused-cache \
+  --model-cache /path/to/huggingface-cache \
+  --ray-address auto \
+  --quality-workers 4 \
+  --quality-gpus-per-worker 0.25 \
+  --score-workers 7 \
+  --max-cache-files 2048 \
+  --max-cache-bytes 214748364800
+```
+
+The fused output remains 1:1 with the raw input. Every row has
+`portrait_quality`; images classified as `portrait_clear` or `human_present`
+also have a 12D Expert Head record. Non-eligible positions contain `null` in
+the aligned `humanaesexpert_expert_scores` list.
+
+The default 8-H100 split uses four lightweight YOLO actors sharing one GPU and
+seven persistent HumanAesExpert actors using one GPU each. The cache router
+deletes `human_uncertain` and `no_human` images before they enter the GPU
+scoring stage. Eligible files are deleted immediately after scoring. The
+cross-process file/byte quota applies to both groups and blocks producers when
+either limit is reached.
+
+Use a dedicated cache root per running job. At startup, the scripts reset stale
+consumer references from an interrupted prior run in that directory, remove
+private partial-download files, and keep complete files as resumable
+zero-reference entries. Those entries are reused when encountered again and
+are evicted first if new downloads need quota capacity.
+
+HumanAesExpert's official `expert_score()` accepts one image at a time; its
+dynamic tiles form the model's internal vision batch. Therefore
+`--score-batch-size` is a Ray scheduling batch, not a native multi-image model
+batch. A moderate value such as 8–16 lets Ray dynamically distribute many
+small tasks across the seven actors, which avoids persistent imbalance when
+different source groups have different portrait hit rates.
+
+The original two-stage scripts remain useful when a durable stage-1 checkpoint,
+independent reruns, or threshold audits are more important than avoiding a
+second S3 download.
 
 Each image receives a `__dj__meta__.portrait_quality` record with:
 

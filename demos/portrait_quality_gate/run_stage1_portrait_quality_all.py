@@ -12,6 +12,11 @@ from pathlib import Path
 
 import yaml
 
+REPOSITORY = Path(__file__).resolve().parents[2]
+if str(REPOSITORY) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY))
+
+from data_juicer.utils.cache_quota import FileCacheQuota  # noqa: E402
 
 def positive_int(value: str) -> int:
     result = int(value)
@@ -64,6 +69,11 @@ def main() -> None:
         parser.error("--input and --output must differ")
     cache_root.mkdir(parents=True, exist_ok=True)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    FileCacheQuota(
+        str(cache_root),
+        max_files=args.max_cache_files,
+        max_bytes=args.max_cache_bytes,
+    ).prepare_for_new_run()
 
     config = {
         "project_name": "portrait-hard-quality-stage1-all",
@@ -116,14 +126,13 @@ def main() -> None:
         ],
     }
 
-    repository = Path(__file__).resolve().parents[2]
     environment = os.environ.copy()
     environment.setdefault("RAY_USE_MULTIPROCESSING_CPU_COUNT", "1")
     existing_pythonpath = environment.get("PYTHONPATH")
     environment["PYTHONPATH"] = (
-        f"{repository}{os.pathsep}{existing_pythonpath}"
+        f"{REPOSITORY}{os.pathsep}{existing_pythonpath}"
         if existing_pythonpath
-        else str(repository)
+        else str(REPOSITORY)
     )
     with tempfile.NamedTemporaryFile(
         mode="w",
@@ -141,7 +150,7 @@ def main() -> None:
                 "--config",
                 config_file.name,
             ],
-            cwd=repository,
+            cwd=REPOSITORY,
             env=environment,
             check=True,
         )
