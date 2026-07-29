@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 readonly PYTHON="/mnt/afs/yanpeishen/.conda/envs/portrait-hae-datajuicer/bin/python"
 readonly REPOSITORY="/mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer"
-readonly SCRIPT="${REPOSITORY}/demos/portrait_quality_gate/run_stage1_portrait_quality_all.py"
+readonly SCRIPT="${REPOSITORY}/demos/portrait_quality_gate/run_sharded_pipeline.py"
 
 if [[ ! -x "${PYTHON}" ]]; then
   echo "Python interpreter is not executable: ${PYTHON}" >&2
@@ -19,5 +19,6 @@ if [[ -z "${AOSS_CONF:-}" || "${AOSS_CONF}" != /* || ! -f "${AOSS_CONF}" ]]; the
 fi
 
 exec "${PYTHON}" "${SCRIPT}" \
+  --mode stage1 \
   --ray-address local \
   "$@"

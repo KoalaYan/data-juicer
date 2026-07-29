@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 readonly PYTHON="/mnt/afs/yanpeishen/.conda/envs/portrait-hae-datajuicer/bin/python"
 readonly REPOSITORY="/mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer"
-readonly SCRIPT="${REPOSITORY}/demos/portrait_quality_gate/run_stage2_humanaesexpert_12d.py"
+readonly SCRIPT="${REPOSITORY}/demos/portrait_quality_gate/run_sharded_pipeline.py"
 readonly MODEL_CACHE="/mnt/afs/yanpeishen/model_cache/huggingface"
 
 if [[ ! -x "${PYTHON}" ]]; then
@@ -20,6 +20,7 @@ if [[ -z "${AOSS_CONF:-}" || "${AOSS_CONF}" != /* || ! -f "${AOSS_CONF}" ]]; the
 fi
 
 exec "${PYTHON}" "${SCRIPT}" \
+  --mode stage2 \
   --model-cache "${MODEL_CACHE}" \
   --ray-address local \
   --score-workers 8 \

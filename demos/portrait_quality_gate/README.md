@@ -132,7 +132,7 @@ absolute paths. The launchers below also use the absolute repository path
 do not hard-code the private `AOSS_CONF` path.
 
 `run_stage1_portrait_quality_all.py` annotates every input row and performs no
-filtering. Its Ray JSON output is therefore 1:1 with the source JSONL, while
+filtering. Its Ray JSON output is therefore 1:1 with each input shard, while
 `images` is restored to the original S3 URI and
 `__dj__meta__.portrait_quality` contains the hard-quality and four-level human
 presence results.
@@ -142,8 +142,10 @@ export AOSS_CONF="/mnt/afs/private/path/to/aoss.conf"
 
 /mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer/demos/portrait_quality_gate/run_stage1_cluster.sh \
   --input /mnt/afs/yanpeishen/datasets/raw.jsonl \
-  --output /mnt/afs/yanpeishen/results/stage1_portrait_quality.jsonl \
+  --output-root /mnt/afs/yanpeishen/results/stage1_portrait_quality \
   --cache-root /mnt/afs/yanpeishen/cache/portrait-stage1 \
+  --work-root /mnt/afs/yanpeishen/work/portrait-stage1 \
+  --shard-size 100000 \
   --max-cache-files 1024 \
   --max-cache-bytes 214748364800
 ```
@@ -156,9 +158,11 @@ first-stage hard-quality `reject` rows:
 
 ```bash
 /mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer/demos/portrait_quality_gate/run_stage2_cluster_8h100.sh \
-  --input /mnt/afs/yanpeishen/results/stage1_portrait_quality.jsonl \
-  --output /mnt/afs/yanpeishen/results/stage2_humanaesexpert_12d.jsonl \
+  --input /mnt/afs/yanpeishen/results/stage1_portrait_quality \
+  --output-root /mnt/afs/yanpeishen/results/stage2_humanaesexpert_12d \
   --cache-root /mnt/afs/yanpeishen/cache/portrait-stage2 \
+  --work-root /mnt/afs/yanpeishen/work/portrait-stage2 \
+  --shard-size 100000 \
   --max-cache-files 256 \
   --max-cache-bytes 107374182400
 ```
@@ -172,13 +176,72 @@ aesthetics, and comprehensive aesthetics. The aggregate `score` is the
 as model diagnostics and must not be used directly as automatic deletion
 criteria.
 
-Both scripts use a cross-process cache quota. Download workers reserve file and
-byte capacity before writing; after scoring, the consumer deletes the local
-file and returns the reservation. When either limit is reached, new downloads
-wait while the GPU continues consuming completed items. Download batch size is
-fixed to one so a partially produced Ray batch cannot occupy the entire quota
-and deadlock itself. Duplicate S3 paths are reference-counted and are deleted
-after their final in-flight consumer.
+Both pipelines use a cross-process cache quota. Download workers reserve file
+and byte capacity before writing; after scoring, the consumer deletes the
+local file and returns the reservation. When either limit is reached, new
+downloads wait while the GPU continues consuming completed items. Download
+batch size is fixed to one so a partially produced Ray batch cannot occupy the
+entire quota and deadlock itself. Duplicate S3 paths are reference-counted and
+are deleted after their final in-flight consumer.
+
+## Task-level shard checkpoints
+
+The three cluster launchers call `run_sharded_pipeline.py`. It streams the
+source JSONL (or a directory containing Ray JSON parts) into deterministic
+input shards. The default is 100,000 records per shard; use
+`--shard-size 1000000` for one-million-record tasks. A completed split is
+described by the atomic `INPUT_MANIFEST` under `--work-root` and is reused on
+restart. The source file list, sizes, mtimes, shard size, row counts, byte
+counts, and per-shard SHA-256 values prevent stale input shards from being
+silently reused.
+
+Each task uses:
+
+```text
+<output-root>/
+  shard-000000/
+    data.jsonl
+    SUCCESS
+  shard-000001/
+    data.jsonl
+    SUCCESS
+```
+
+Ray first writes into
+`<output-root>/.attempts/shard-N.<pid>.<uuid>/ray_output.jsonl/`. Its JSON
+parts are validated and normalized into one bounded `data.jsonl` for that
+task. There is deliberately no final cross-shard merge.
+
+`SUCCESS` is created atomically only after:
+
+- every non-empty output line parses as JSON;
+- stage 1 and fused output rows equal input rows;
+- stage 2 output rows equal the exact count implied by its portrait filter;
+- the shard-local image cache has zero payload files, bytes, and references.
+
+A restart skips a shard only when its `SUCCESS`, `data.jsonl`, mode, input row
+count, and input SHA-256 agree. An incomplete final directory and any stale
+attempt directory are removed before that shard is rerun. Failed-attempt
+diagnostics are kept under `<work-root>/failures`, while incomplete output is
+removed. The failed shard's cache remains available for safe resumable
+downloads and is removed after a successful retry.
+
+To rerun or inspect only shard 42:
+
+```bash
+/mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer/demos/portrait_quality_gate/run_fused_cluster_8h100.sh \
+  --input /mnt/afs/yanpeishen/datasets/raw.jsonl \
+  --output-root /mnt/afs/yanpeishen/results/portrait_quality_and_expert12d \
+  --cache-root /mnt/afs/yanpeishen/cache/portrait-fused \
+  --work-root /mnt/afs/yanpeishen/work/portrait-fused \
+  --shard-size 100000 \
+  --shard-index 42
+```
+
+If the source or shard size intentionally changes, pass
+`--rebuild-input-shards`. This discards the old input split and completed
+output shard directories before rebuilding, so it should not be used during a
+normal resume.
 
 ## One-download fused mode on 8 H100s
 
@@ -200,13 +263,15 @@ pipeline:
 ```bash
 /mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer/demos/portrait_quality_gate/run_fused_cluster_8h100.sh \
   --input /mnt/afs/yanpeishen/datasets/raw.jsonl \
-  --output /mnt/afs/yanpeishen/results/portrait_quality_and_expert12d.jsonl \
+  --output-root /mnt/afs/yanpeishen/results/portrait_quality_and_expert12d \
   --cache-root /mnt/afs/yanpeishen/cache/portrait-fused \
+  --work-root /mnt/afs/yanpeishen/work/portrait-fused \
+  --shard-size 100000 \
   --max-cache-files 2048 \
   --max-cache-bytes 214748364800
 ```
 
-The fused output remains 1:1 with the raw input. Every row has
+Each fused output shard remains 1:1 with its raw input shard. Every row has
 `portrait_quality`; images classified as `portrait_clear` or `human_present`
 also have a 12D Expert Head record. Non-eligible positions contain `null` in
 the aligned `humanaesexpert_expert_scores` list.

@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 readonly PYTHON="/mnt/afs/yanpeishen/.conda/envs/portrait-hae-datajuicer/bin/python"
 readonly REPOSITORY="/mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer"
-readonly SCRIPT="${REPOSITORY}/demos/portrait_quality_gate/run_fused_portrait_humanaesexpert.py"
+readonly SCRIPT="${REPOSITORY}/demos/portrait_quality_gate/run_sharded_pipeline.py"
 readonly MODEL_CACHE="/mnt/afs/yanpeishen/model_cache/huggingface"
 readonly YOLO_MODEL="/mnt/afs/yanpeishen/.cache/data_juicer/models/yolo11n.pt"
 readonly YOLO_POSE_MODEL="/mnt/afs/yanpeishen/.cache/data_juicer/models/yolo11n-pose.pt"
@@ -22,6 +22,7 @@ if [[ -z "${AOSS_CONF:-}" || "${AOSS_CONF}" != /* || ! -f "${AOSS_CONF}" ]]; the
 fi
 
 exec "${PYTHON}" "${SCRIPT}" \
+  --mode fused \
   --model-cache "${MODEL_CACHE}" \
   --yolo-model "${YOLO_MODEL}" \
   --yolo-pose-model "${YOLO_POSE_MODEL}" \
