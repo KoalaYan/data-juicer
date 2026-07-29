@@ -162,6 +162,27 @@ class ImagePortraitQualityMapperTest(DataJuicerTestCaseBase):
         self.assertEqual(first["human_status"], "human_present")
         self.assertEqual(second["human_status"], "no_human")
 
+    def test_face_detection_on_resized_image_maps_box_to_original(self):
+        op = ImagePortraitQualityMapper(
+            detect_people=False,
+            detect_faces_enabled=True,
+            detect_pose=False,
+            require_human=True,
+            max_analysis_side=1000,
+        )
+        seen_sizes = []
+
+        def detect_faces(image):
+            seen_sizes.append(image.size)
+            return [(100, 50, 200, 100)]
+
+        op._detect_faces = detect_faces
+        boxes = op._detect_faces_at_analysis_resolution(
+            Image.new("RGB", (2000, 1000), (128, 128, 128))
+        )
+        self.assertEqual(seen_sizes, [(1000, 500)])
+        self.assertEqual(boxes, [(200, 100, 400, 200)])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -335,6 +335,21 @@ class ImagePortraitQualityMapper(Mapper):
         )
         return [(int(x), int(y), int(w), int(h)) for x, y, w, h in detections]
 
+    def _detect_faces_at_analysis_resolution(self, image) -> List[Tuple[int, int, int, int]]:
+        resized, scale_x, scale_y = _resize_for_analysis(image, self.max_analysis_side)
+        detections = self._detect_faces(resized)
+        if scale_x == 1.0 and scale_y == 1.0:
+            return detections
+        return [
+            (
+                int(round(x / scale_x)),
+                int(round(y / scale_y)),
+                int(round(w / scale_x)),
+                int(round(h / scale_y)),
+            )
+            for x, y, w, h in detections
+        ]
+
     def _analyze_image(self, image, rank=None, detections=None) -> Dict:
         original_width, original_height = image.size
         if detections is None:
@@ -352,7 +367,7 @@ class ImagePortraitQualityMapper(Mapper):
                     logger.warning(f"Portrait person detection failed: {e}")
             if self.detect_faces_enabled:
                 try:
-                    face_boxes = self._detect_faces(image)
+                    face_boxes = self._detect_faces_at_analysis_resolution(image)
                 except Exception as e:
                     detection_errors.append(f"face_detector:{type(e).__name__}")
                     logger.warning(f"Portrait face detection failed: {e}")
@@ -599,7 +614,7 @@ class ImagePortraitQualityMapper(Mapper):
         if self.detect_faces_enabled:
             for idx, image in enumerate(images):
                 try:
-                    faces[idx] = self._detect_faces(image)
+                    faces[idx] = self._detect_faces_at_analysis_resolution(image)
                 except Exception as e:
                     errors[idx].append(f"face_detector:{type(e).__name__}")
                     logger.warning(f"Portrait face detection failed: {e}")
