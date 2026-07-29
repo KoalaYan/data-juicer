@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 readonly PYTHON="/mnt/afs/yanpeishen/.conda/envs/portrait-hae-datajuicer/bin/python"
+readonly RAY="/mnt/afs/yanpeishen/.conda/envs/portrait-hae-datajuicer/bin/ray"
 readonly REPOSITORY="/mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer"
 readonly SCRIPT="${REPOSITORY}/demos/portrait_quality_gate/run_sharded_pipeline.py"
 readonly POOL_MANAGER="${REPOSITORY}/demos/portrait_quality_gate/manage_humanaesexpert_pool.py"
@@ -9,10 +10,12 @@ readonly MODEL_CACHE="/mnt/afs/yanpeishen/model_cache/huggingface"
 readonly YOLO_MODEL="/mnt/afs/yanpeishen/.cache/data_juicer/models/yolo11n.pt"
 readonly YOLO_POSE_MODEL="/mnt/afs/yanpeishen/.cache/data_juicer/models/yolo11n-pose.pt"
 
-if [[ ! -x "${PYTHON}" ]]; then
-  echo "Python interpreter is not executable: ${PYTHON}" >&2
-  exit 1
-fi
+for executable in "${PYTHON}" "${RAY}"; do
+  if [[ ! -x "${executable}" ]]; then
+    echo "Required executable is not executable: ${executable}" >&2
+    exit 1
+  fi
+done
 for required in "${SCRIPT}" "${POOL_MANAGER}"; do
   if [[ ! -f "${required}" ]]; then
     echo "Required script does not exist: ${required}" >&2
@@ -37,20 +40,20 @@ cleanup() {
     --prefix humanaesexpert \
     --size 7 >/dev/null 2>&1 || true
   if [[ "${ray_owned}" -eq 1 ]]; then
-    "${PYTHON}" -m ray stop --force >/dev/null 2>&1 || true
+    "${RAY}" stop --force >/dev/null 2>&1 || true
   fi
   exit "${exit_code}"
 }
 trap cleanup EXIT
 
-if "${PYTHON}" -m ray status >/dev/null 2>&1; then
+if "${RAY}" status >/dev/null 2>&1; then
   if [[ "${PORTRAIT_ALLOW_EXISTING_RAY:-0}" != "1" ]]; then
     echo "A Ray cluster is already running. Set PORTRAIT_ALLOW_EXISTING_RAY=1" \
       "only when this job owns its seven free GPUs." >&2
     exit 1
   fi
 else
-  "${PYTHON}" -m ray start --head --disable-usage-stats
+  "${RAY}" start --head --disable-usage-stats
   ray_owned=1
 fi
 
