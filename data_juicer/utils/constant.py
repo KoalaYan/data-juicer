@@ -103,6 +103,8 @@ class MetaKeys(object):
 
     # # pose information
     pose_info = "pose_info"
+    # # lightweight portrait hard-quality signals and triage
+    portrait_quality = "portrait_quality"
     # # Camera Calibration Info (for DeepCalib)
     camera_calibration_deepcalib_tags = "camera_calibration_deepcalib_tags"
     # # Camera Calibration Info (for Moge-2)

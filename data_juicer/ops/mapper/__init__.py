@@ -52,6 +52,7 @@ from .image_detection_yolo_mapper import ImageDetectionYoloMapper
 from .image_diffusion_mapper import ImageDiffusionMapper
 from .image_face_blur_mapper import ImageFaceBlurMapper
 from .image_mmpose_mapper import ImageMMPoseMapper
+from .image_portrait_quality_mapper import ImagePortraitQualityMapper
 from .image_remove_background_mapper import ImageRemoveBackgroundMapper
 from .image_sam_3d_body_mapper import ImageSAM3DBodyMapper
 from .image_segment_mapper import ImageSegmentMapper
@@ -208,6 +209,7 @@ __all__ = [
     "ImageDetectionYoloMapper",
     "ImageDiffusionMapper",
     "ImageMMPoseMapper",
+    "ImagePortraitQualityMapper",
     "ImageFaceBlurMapper",
     "ImageRemoveBackgroundMapper",
     "ImageSAM3DBodyMapper",

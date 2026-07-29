@@ -1,0 +1,13 @@
+# Apply only after auditing score.yaml output and calibrating thresholds.
+project_name: portrait-hard-quality-filter
+dataset_path: ./outputs/portrait-hard-quality/scored.jsonl
+export_path: ./outputs/portrait-hard-quality/selected.jsonl
+
+np: 4
+skip_op_error: false
+
+process:
+  - image_portrait_quality_filter:
+      keep_statuses: [pass, uncertain]
+      any_or_all: all
+      keep_missing: false

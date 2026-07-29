@@ -1,12 +1,75 @@
+import os
+import pickle
+import tempfile
 import unittest
+from unittest.mock import patch
 
+from data_juicer.ops.mapper.s3_download_file_mapper import S3DownloadFileMapper
 from data_juicer.utils.unittest_utils import DataJuicerTestCaseBase
+
+
+class _FakeAOSSClient:
+    def get(self, url):
+        return f"content:{url}".encode()
+
 
 class S3DownloadFileMapperTest(DataJuicerTestCaseBase):
 
-    def test_placeholder(self):
-        # placeholder for test
-        pass
+    @patch.dict(os.environ, {"AOSS_CONF": "/private/runtime/aoss.conf"})
+    def test_aoss_backend_downloads_to_memory(self):
+        op = S3DownloadFileMapper(
+            download_field="images",
+            save_field="image_bytes",
+            s3_backend="aoss",
+        )
+        op._thread_local.aoss_client = _FakeAOSSClient()
+        status, error, content, save_path = op._download_from_s3(
+            "s3://infographics/example.jpg",
+            return_content=True,
+        )
+        self.assertEqual(status, "success")
+        self.assertIsNone(error)
+        self.assertEqual(content, b"content:s3://infographics/example.jpg")
+        self.assertIsNone(save_path)
+
+    @patch.dict(os.environ, {"AOSS_CONF": "/private/runtime/aoss.conf"})
+    def test_aoss_operator_is_serializable(self):
+        op = S3DownloadFileMapper(
+            download_field="images",
+            save_field="image_bytes",
+            s3_backend="aoss",
+        )
+        restored = pickle.loads(pickle.dumps(op))
+        self.assertEqual(restored.s3_backend, "aoss")
+        self.assertIsNotNone(restored._thread_local)
+
+    @patch.dict(os.environ, {"AOSS_CONF": "/private/runtime/aoss.conf"})
+    def test_aoss_preserves_uri_and_bucket_key_cache_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            op = S3DownloadFileMapper(
+                download_field="images",
+                save_dir=tmpdir,
+                source_field="source_images",
+                preserve_s3_paths=True,
+                s3_backend="aoss",
+                resume_download=True,
+            )
+            op._thread_local.aoss_client = _FakeAOSSClient()
+            samples = {"images": [["s3://infographics/a/b/example.jpg"]]}
+            output = op.process_batched(samples)
+            expected_path = os.path.join(tmpdir, "infographics", "a", "b", "example.jpg")
+            self.assertEqual(output["source_images"], [["s3://infographics/a/b/example.jpg"]])
+            self.assertEqual(output["images"], [[expected_path]])
+            self.assertTrue(os.path.isfile(expected_path))
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_aoss_backend_requires_environment_variable(self):
+        with self.assertRaisesRegex(ValueError, "AOSS_CONF"):
+            S3DownloadFileMapper(
+                download_field="images",
+                save_field="image_bytes",
+                s3_backend="aoss",
+            )
 
 
 if __name__ == '__main__':

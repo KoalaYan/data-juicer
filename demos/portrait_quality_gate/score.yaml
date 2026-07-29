@@ -1,0 +1,31 @@
+# Score-only recipe: keep all samples so thresholds can be audited before filtering.
+project_name: portrait-hard-quality-score
+dataset_path: /path/to/input.jsonl
+export_path: ./outputs/portrait-hard-quality/scored.jsonl
+
+np: 4
+image_key: images
+image_bytes_key: image_bytes
+skip_op_error: false
+keep_stats_in_res_ds: true
+
+process:
+  - s3_download_file_mapper:
+      download_field: images
+      save_dir: /tmp/data_juicer_portrait_cache
+      source_field: source_images
+      resume_download: true
+      max_concurrent: 8
+      preserve_s3_paths: true
+      s3_backend: aoss
+      aoss_config_env: AOSS_CONF
+
+  - image_portrait_quality_mapper:
+      detect_people: true
+      detect_faces_enabled: true
+      require_human: true
+      yolo_model_path: yolo11n.pt
+      person_confidence: 0.35
+      max_analysis_side: 1024
+      # Blur rejection is disabled until calibrated on project data.
+      min_sharpness_score: 0.0

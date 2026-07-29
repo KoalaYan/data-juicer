@@ -12,6 +12,7 @@ from .image_face_count_filter import ImageFaceCountFilter
 from .image_face_ratio_filter import ImageFaceRatioFilter
 from .image_nsfw_filter import ImageNSFWFilter
 from .image_pair_similarity_filter import ImagePairSimilarityFilter
+from .image_portrait_quality_filter import ImagePortraitQualityFilter
 from .image_shape_filter import ImageShapeFilter
 from .image_size_filter import ImageSizeFilter
 from .image_subplot_filter import ImageSubplotFilter
@@ -73,6 +74,7 @@ __all__ = [
     "ImageFaceRatioFilter",
     "ImageNSFWFilter",
     "ImagePairSimilarityFilter",
+    "ImagePortraitQualityFilter",
     "ImageShapeFilter",
     "ImageSizeFilter",
     "ImageSubplotFilter",

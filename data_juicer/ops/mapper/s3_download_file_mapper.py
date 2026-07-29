@@ -1,7 +1,9 @@
 import asyncio
 import copy
+import hashlib
 import os
 import os.path as osp
+import threading
 from typing import List, Union
 
 from loguru import logger
@@ -46,6 +48,10 @@ class S3DownloadFileMapper(Mapper):
         aws_session_token: str = None,
         aws_region: str = None,
         endpoint_url: str = None,
+        s3_backend: str = "auto",
+        aoss_config_env: str = "AOSS_CONF",
+        preserve_s3_paths: bool = False,
+        source_field: str = None,
         *args,
         **kwargs,
     ):
@@ -63,6 +69,17 @@ class S3DownloadFileMapper(Mapper):
         :param aws_session_token: AWS session token for S3 (optional).
         :param aws_region: AWS region for S3.
         :param endpoint_url: Custom S3 endpoint URL (for S3-compatible services).
+        :param s3_backend: S3 client backend. ``auto`` selects the internal
+            AOSS client when ``aoss_config_env`` is set, otherwise boto3.
+            Supported values are ``auto``, ``boto3`` and ``aoss``.
+        :param aoss_config_env: Name of the environment variable that points
+            to the private AOSS client config. The config path and credentials
+            are never stored in the operator config or output samples.
+        :param preserve_s3_paths: When saving to ``save_dir``, preserve the
+            bucket/key hierarchy instead of using only the basename. This
+            avoids filename collisions in large datasets.
+        :param source_field: Optional field used to preserve the original
+            remote URLs before ``download_field`` is replaced by local paths.
         :param args: extra args
         :param kwargs: extra args
         """
@@ -86,6 +103,22 @@ class S3DownloadFileMapper(Mapper):
 
         self.timeout = timeout
         self.max_concurrent = max_concurrent
+        if s3_backend not in {"auto", "boto3", "aoss"}:
+            raise ValueError("s3_backend must be one of ['auto', 'boto3', 'aoss']")
+        self.aoss_config_env = aoss_config_env
+        self.aoss_config_path = os.environ.get(aoss_config_env)
+        if s3_backend == "auto":
+            self.s3_backend = "aoss" if self.aoss_config_path else "boto3"
+        else:
+            self.s3_backend = s3_backend
+        if self.s3_backend == "aoss" and not self.aoss_config_path:
+            raise ValueError(
+                f"AOSS backend requires environment variable {self.aoss_config_env!r} "
+                "to point to the private client config"
+            )
+        self.preserve_s3_paths = preserve_s3_paths
+        self.source_field = source_field
+        self._thread_local = threading.local()
 
         # Prepare config dict for get_aws_credentials
         ds_config = {}
@@ -111,7 +144,9 @@ class S3DownloadFileMapper(Mapper):
         # Store S3 configuration (don't create client here to avoid serialization issues)
         self.s3_config = None
         self._s3_client = None
-        if resolved_access_key_id and resolved_secret_access_key:
+        if self.s3_backend == "aoss":
+            logger.info(f"Using AOSS backend configured via environment variable {self.aoss_config_env}")
+        elif resolved_access_key_id and resolved_secret_access_key:
             self.s3_config = {
                 "aws_access_key_id": resolved_access_key_id,
                 "aws_secret_access_key": resolved_secret_access_key,
@@ -126,6 +161,17 @@ class S3DownloadFileMapper(Mapper):
         else:
             logger.info("No S3 credentials provided. S3 URLs will not be supported.")
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_s3_client"] = None
+        state["_thread_local"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._s3_client = None
+        self._thread_local = threading.local()
+
     @property
     def s3_client(self):
         """Lazy initialization of S3 client to avoid serialization issues with Ray."""
@@ -133,6 +179,27 @@ class S3DownloadFileMapper(Mapper):
             self._s3_client = boto3.client("s3", **self.s3_config)
             logger.debug("S3 client initialized (lazy)")
         return self._s3_client
+
+    def _create_aoss_client(self):
+        try:
+            from aoss_client.client import Client
+        except ImportError as e:
+            raise ImportError(
+                "AOSS backend requires the internal 'aoss_client' package in the runtime environment"
+            ) from e
+        return Client(self.aoss_config_path)
+
+    @property
+    def aoss_client(self):
+        """Return one AOSS client per worker thread.
+
+        The internal client is not assumed to be thread-safe. The private
+        config path comes exclusively from the configured environment
+        variable and is never logged or serialized into output samples.
+        """
+        if not hasattr(self._thread_local, "aoss_client"):
+            self._thread_local.aoss_client = self._create_aoss_client()
+        return self._thread_local.aoss_client
 
     def _is_s3_url(self, url: str) -> bool:
         """Check if the URL is an S3 URL."""
@@ -152,6 +219,48 @@ class S3DownloadFileMapper(Mapper):
 
         return bucket, key
 
+    def _get_local_save_path(self, s3_url: str, save_dir: str) -> str:
+        bucket, key = self._parse_s3_url(s3_url)
+        if not bucket or bucket in {".", ".."} or "/" in bucket or "\\" in bucket:
+            raise ValueError(f"Unsafe S3 bucket: {bucket}")
+        if self.preserve_s3_paths:
+            normalized_key = osp.normpath(key).lstrip("/\\")
+            if normalized_key == ".." or normalized_key.startswith(("../", "..\\")):
+                raise ValueError(f"Unsafe S3 key: {key}")
+            target = osp.abspath(osp.join(save_dir, bucket, normalized_key))
+            cache_root = osp.abspath(save_dir)
+            if osp.commonpath([cache_root, target]) != cache_root:
+                raise ValueError(f"Unsafe S3 cache target for key: {key}")
+            return target
+
+        filename = osp.basename(key)
+        if not filename:
+            filename = hashlib.sha256(s3_url.encode("utf-8")).hexdigest()
+        return osp.join(save_dir, filename)
+
+    def _download_from_aoss(self, s3_url: str, save_path: str = None, return_content: bool = False):
+        try:
+            content = self.aoss_client.get(s3_url)
+            if hasattr(content, "read"):
+                content = content.read()
+            if content is None:
+                raise FileNotFoundError(f"AOSS returned no data for {s3_url}")
+            if not isinstance(content, bytes):
+                content = bytes(content)
+
+            if save_path:
+                save_parent = osp.dirname(save_path)
+                if save_parent:
+                    os.makedirs(save_parent, exist_ok=True)
+                with open(save_path, "wb") as f:
+                    f.write(content)
+
+            return "success", None, content if return_content else None, save_path
+        except Exception as e:
+            error_msg = f"AOSS download error: {e}"
+            logger.error(error_msg)
+            return "failed", error_msg, None, None
+
     def _download_from_s3(self, s3_url: str, save_path: str = None, return_content: bool = False):
         """Download a file from S3.
 
@@ -160,6 +269,9 @@ class S3DownloadFileMapper(Mapper):
         :param return_content: Whether to return file content as bytes
         :return: (status, response, content, save_path)
         """
+        if self.s3_backend == "aoss":
+            return self._download_from_aoss(s3_url, save_path, return_content)
+
         if not self.s3_client:
             raise ValueError("S3 client not initialized. Please provide AWS credentials.")
 
@@ -222,8 +334,7 @@ class S3DownloadFileMapper(Mapper):
                     # Handle S3 URLs (synchronous operation in async context)
                     if self._is_s3_url(url):
                         if save_dir:
-                            filename = os.path.basename(self._parse_s3_url(url)[1])
-                            save_path = osp.join(save_dir, filename)
+                            save_path = self._get_local_save_path(url, save_dir)
 
                             # Check if file exists and resume is enabled
                             if os.path.exists(save_path) and self.resume_download:
@@ -377,6 +488,14 @@ class S3DownloadFileMapper(Mapper):
             return samples
 
         batch_nested_urls = samples[self.download_field]
+        if self.source_field:
+            if self.source_field in samples and not self.resume_download:
+                raise ValueError(
+                    f"{self.source_field} is already in samples. "
+                    "Choose another source_field or set resume_download=True"
+                )
+            if self.source_field not in samples:
+                samples[self.source_field] = copy.deepcopy(batch_nested_urls)
 
         if self.save_field:
             if not self.resume_download:
