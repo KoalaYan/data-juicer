@@ -57,6 +57,7 @@ class S3DownloadFileMapper(Mapper):
         max_cache_bytes: int = 0,
         cache_quota_wait_timeout: float = 1800.0,
         cache_quota_poll_interval: float = 1.0,
+        fail_on_download_error: bool = False,
         *args,
         **kwargs,
     ):
@@ -92,6 +93,9 @@ class S3DownloadFileMapper(Mapper):
         :param cache_quota_wait_timeout: Maximum time a downloader waits for a
             downstream consumer to delete files and return cache capacity.
         :param cache_quota_poll_interval: Cache-capacity polling interval.
+        :param fail_on_download_error: Raise immediately after a download
+            batch contains failed objects instead of passing their remote URI
+            to downstream operators.
         :param args: extra args
         :param kwargs: extra args
         """
@@ -139,6 +143,7 @@ class S3DownloadFileMapper(Mapper):
         self.max_cache_bytes = int(max_cache_bytes)
         self.cache_quota_wait_timeout = float(cache_quota_wait_timeout)
         self.cache_quota_poll_interval = float(cache_quota_poll_interval)
+        self.fail_on_download_error = fail_on_download_error
         self._cache_quota = self._create_cache_quota()
 
         # Prepare config dict for get_aws_credentials
@@ -323,7 +328,7 @@ class S3DownloadFileMapper(Mapper):
                 os.remove(temporary_path)
             if reservation_owned and self._cache_quota is not None and save_path:
                 self._cache_quota.release(save_path)
-            error_msg = f"AOSS download error: {e}"
+            error_msg = f"AOSS download error for {s3_url}: {e}"
             logger.error(error_msg)
             return "failed", error_msg, None, None
 
@@ -628,5 +633,9 @@ class S3DownloadFileMapper(Mapper):
 
         if len(failed_info):
             logger.error(f"Failed files:\n{failed_info}")
+            if self.fail_on_download_error:
+                raise RuntimeError(
+                    "one or more downloads failed:" + failed_info
+                )
 
         return samples

@@ -94,8 +94,8 @@ def main() -> None:
         default=200 * 1024**3,
         help="Hard cache byte cap; default: 200 GiB.",
     )
-    parser.add_argument("--download-workers", type=positive_int, default=16)
-    parser.add_argument("--download-concurrency", type=positive_int, default=8)
+    parser.add_argument("--download-workers", type=positive_int, default=8)
+    parser.add_argument("--download-concurrency", type=positive_int, default=1)
     parser.add_argument("--quality-workers", type=positive_int, default=4)
     parser.add_argument(
         "--quality-gpus-per-worker",
@@ -187,6 +187,7 @@ def main() -> None:
                     "max_concurrent": args.download_concurrency,
                     "max_cache_files": args.max_cache_files,
                     "max_cache_bytes": args.max_cache_bytes,
+                    "fail_on_download_error": True,
                 }
             },
             {

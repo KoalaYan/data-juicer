@@ -145,7 +145,8 @@ export AOSS_CONF="/mnt/afs/private/path/to/aoss.conf"
   --output-root /mnt/afs/yanpeishen/results/stage1_portrait_quality \
   --cache-root /mnt/afs/yanpeishen/cache/portrait-stage1 \
   --work-root /mnt/afs/yanpeishen/work/portrait-stage1 \
-  --shard-size 100000 \
+  --logical-shard-size 100000 \
+  --micro-shard-size 10000 \
   --max-cache-files 1024 \
   --max-cache-bytes 214748364800
 ```
@@ -162,7 +163,8 @@ first-stage hard-quality `reject` rows:
   --output-root /mnt/afs/yanpeishen/results/stage2_humanaesexpert_12d \
   --cache-root /mnt/afs/yanpeishen/cache/portrait-stage2 \
   --work-root /mnt/afs/yanpeishen/work/portrait-stage2 \
-  --shard-size 100000 \
+  --logical-shard-size 100000 \
+  --micro-shard-size 10000 \
   --max-cache-files 256 \
   --max-cache-bytes 107374182400
 ```
@@ -188,43 +190,48 @@ are deleted after their final in-flight consumer.
 
 The three cluster launchers call `run_sharded_pipeline.py`. It streams the
 source JSONL (or a directory containing Ray JSON parts) into deterministic
-input shards. The default is 100,000 records per shard; use
-`--shard-size 1000000` for one-million-record tasks. A completed split is
-described by the atomic `INPUT_MANIFEST` under `--work-root` and is reused on
-restart. The source file list, sizes, mtimes, shard size, row counts, byte
-counts, and per-shard SHA-256 values prevent stale input shards from being
-silently reused.
+10,000-record micro-shards grouped under 100,000-record logical shards. Both
+sizes are configurable, and the logical size must be an exact multiple of the
+micro size. A completed split is described by the atomic `INPUT_MANIFEST`
+under `--work-root` and is reused on restart. The source file list, sizes,
+mtimes, both shard sizes, row counts, byte counts, and per-micro-shard SHA-256
+values prevent stale inputs from being silently reused.
 
 Each task uses:
 
 ```text
 <output-root>/
   shard-000000/
-    data.jsonl
     SUCCESS
-  shard-000001/
-    data.jsonl
-    SUCCESS
+    micro-0000/
+      data.jsonl
+      SUCCESS
+    micro-0001/
+      data.jsonl
+      SUCCESS
+    ...
 ```
 
 Ray first writes into
-`<output-root>/.attempts/shard-N.<pid>.<uuid>/ray_output.jsonl/`. Its JSON
-parts are validated and normalized into one bounded `data.jsonl` for that
-task. There is deliberately no final cross-shard merge.
+`<output-root>/.attempts/shard-N-micro-M.<pid>.<uuid>/ray_output.jsonl/`.
+Its JSON parts are validated and normalized into one bounded `data.jsonl` for
+that micro-shard. There is deliberately no final merge across micro-shards or
+logical shards.
 
-`SUCCESS` is created atomically only after:
+Each micro-shard `SUCCESS` is created atomically only after:
 
 - every non-empty output line parses as JSON;
 - stage 1 and fused output rows equal input rows;
 - stage 2 output rows equal the exact count implied by its portrait filter;
 - the shard-local image cache has zero payload files, bytes, and references.
 
-A restart skips a shard only when its `SUCCESS`, `data.jsonl`, mode, input row
-count, and input SHA-256 agree. An incomplete final directory and any stale
-attempt directory are removed before that shard is rerun. Failed-attempt
-diagnostics are kept under `<work-root>/failures`, while incomplete output is
-removed. The failed shard's cache remains available for safe resumable
-downloads and is removed after a successful retry.
+A logical-shard `SUCCESS` is created after all of its micro-shards have valid
+markers. A restart skips a micro-shard only when its `SUCCESS`, `data.jsonl`,
+mode, input row count, and input SHA-256 agree. An incomplete final directory
+and any stale attempt directory are removed before that micro-shard is rerun.
+Failed-attempt diagnostics are kept under `<work-root>/failures`, while
+incomplete output is removed. The failed micro-shard's cache remains available
+for safe resumable downloads and is removed after a successful retry.
 
 To rerun or inspect only shard 42:
 
@@ -234,14 +241,52 @@ To rerun or inspect only shard 42:
   --output-root /mnt/afs/yanpeishen/results/portrait_quality_and_expert12d \
   --cache-root /mnt/afs/yanpeishen/cache/portrait-fused \
   --work-root /mnt/afs/yanpeishen/work/portrait-fused \
-  --shard-size 100000 \
-  --shard-index 42
+  --logical-shard-size 100000 \
+  --micro-shard-size 10000 \
+  --logical-shard-index 42
 ```
 
 If the source or shard size intentionally changes, pass
 `--rebuild-input-shards`. This discards the old input split and completed
 output shard directories before rebuilding, so it should not be used during a
 normal resume.
+
+`--input-adapter purchased-selection` converts the existing purchased-data
+selection manifest (`image` plus `_sample.image_uri`) into the Data-Juicer
+`images` and non-empty `text` fields while preserving all provenance fields.
+
+For the fixed `human_baixing_0515` first-100k fused smoke run, use:
+
+```bash
+export AOSS_CONF="/mnt/afs/private/path/to/aoss.conf"
+
+/mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer/demos/portrait_quality_gate/run_fused_first100k_cluster_8h100.sh
+```
+
+The smoke launcher uses eight download workers with one in-flight request per
+single-sample batch. The installed AOSS client already performs up to ten
+internal attempts. A final download failure is raised immediately in the
+download operator so the current micro-shard fails with its S3 URI instead of
+failing later during image decoding.
+
+Monitor structured progress:
+
+```bash
+/mnt/afs/yanpeishen/.conda/envs/portrait-hae-datajuicer/bin/python \
+  /mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer/demos/portrait_quality_gate/show_sharded_progress.py \
+  --output-root /mnt/afs/yanpeishen/project/t2i/purchased-data-governance/results/portrait_quality_gate/human_baixing_0515_fused_first100k_micro10k_20260729/output \
+  --work-root /mnt/afs/yanpeishen/project/t2i/purchased-data-governance/results/portrait_quality_gate/human_baixing_0515_fused_first100k_micro10k_20260729/work \
+  --cache-root /mnt/afs/yanpeishen/cache/data-juicer/human_baixing_0515_fused_first100k_micro10k_20260729 \
+  --logical-shard-index 0 \
+  --watch-seconds 10
+```
+
+Monitor the full pipeline log:
+
+```bash
+/usr/bin/tail -F \
+  /mnt/afs/yanpeishen/project/t2i/purchased-data-governance/results/portrait_quality_gate/human_baixing_0515_fused_first100k_micro10k_20260729/logs/pipeline.log
+```
 
 ## One-download fused mode on 8 H100s
 
@@ -266,7 +311,8 @@ pipeline:
   --output-root /mnt/afs/yanpeishen/results/portrait_quality_and_expert12d \
   --cache-root /mnt/afs/yanpeishen/cache/portrait-fused \
   --work-root /mnt/afs/yanpeishen/work/portrait-fused \
-  --shard-size 100000 \
+  --logical-shard-size 100000 \
+  --micro-shard-size 10000 \
   --max-cache-files 2048 \
   --max-cache-bytes 214748364800
 ```

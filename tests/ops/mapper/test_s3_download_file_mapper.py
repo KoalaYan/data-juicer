@@ -13,6 +13,11 @@ class _FakeAOSSClient:
         return f"content:{url}".encode()
 
 
+class _FailingAOSSClient:
+    def get(self, url):
+        raise TimeoutError(f"timed out: {url}")
+
+
 class S3DownloadFileMapperTest(DataJuicerTestCaseBase):
 
     @patch.dict(os.environ, {"AOSS_CONF": "/private/runtime/aoss.conf"})
@@ -112,6 +117,25 @@ class S3DownloadFileMapperTest(DataJuicerTestCaseBase):
                     )
                 )
             )
+
+    @patch.dict(os.environ, {"AOSS_CONF": "/private/runtime/aoss.conf"})
+    def test_fail_on_download_error_raises_at_download_stage(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            op = S3DownloadFileMapper(
+                download_field="images",
+                save_dir=tmpdir,
+                preserve_s3_paths=True,
+                s3_backend="aoss",
+                fail_on_download_error=True,
+            )
+            op._create_aoss_client = lambda: _FailingAOSSClient()
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "one or more downloads failed",
+            ):
+                op.process_batched(
+                    {"images": [["s3://infographics/timeout.jpg"]]}
+                )
 
     @patch.dict(os.environ, {}, clear=True)
     def test_aoss_backend_requires_environment_variable(self):

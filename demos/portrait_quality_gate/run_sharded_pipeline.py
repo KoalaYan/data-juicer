@@ -157,20 +157,76 @@ def source_fingerprint(files: Sequence[Path]) -> Tuple[str, List[dict]]:
     return hashlib.sha256(encoded).hexdigest(), entries
 
 
-def iter_nonempty_lines(files: Iterable[Path]) -> Iterator[bytes]:
+def adapt_input_record(
+    line: bytes,
+    input_adapter: str,
+    source_path: Path,
+    line_number: int,
+) -> bytes:
+    if input_adapter == "none":
+        return line.strip() + b"\n"
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"invalid input JSON at {source_path}:{line_number}"
+        ) from error
+    if input_adapter == "purchased-selection":
+        sample = record.get("_sample") or {}
+        image_uri = sample.get("image_uri")
+        if not image_uri:
+            raise ValueError(
+                "purchased-selection record has no _sample.image_uri at "
+                f"{source_path}:{line_number}"
+            )
+        conversations = record.get("conversations") or []
+        text = next(
+            (
+                item.get("value", "")
+                for item in conversations
+                if item.get("from") == "human" and item.get("value")
+            ),
+            "portrait_quality_gate",
+        )
+        record["images"] = [image_uri]
+        record["text"] = text
+        record.setdefault("image_root", sample.get("image_root"))
+        record.setdefault("source_meta", sample.get("source_meta"))
+        record.setdefault("source_offset", sample.get("offset"))
+        return (
+            json.dumps(
+                record,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
+    raise ValueError(f"unsupported input adapter: {input_adapter}")
+
+
+def iter_nonempty_lines(
+    files: Iterable[Path],
+    input_adapter: str,
+) -> Iterator[bytes]:
     for path in files:
         with path.open("rb") as source:
-            for line in source:
-                normalized = line.strip()
-                if normalized:
-                    yield normalized + b"\n"
+            for line_number, line in enumerate(source, start=1):
+                if line.strip():
+                    yield adapt_input_record(
+                        line,
+                        input_adapter,
+                        path,
+                        line_number,
+                    )
 
 
 def build_input_shards(
     source_files: Sequence[Path],
     source_entries: List[dict],
     fingerprint: str,
-    shard_size: int,
+    logical_shard_size: int,
+    micro_shard_size: int,
+    input_adapter: str,
     work_root: Path,
     rebuild: bool,
 ) -> Dict[str, Any]:
@@ -179,9 +235,11 @@ def build_input_shards(
     if manifest_path.is_file() and not rebuild:
         manifest = load_json(manifest_path)
         expected = {
-            "version": 1,
+            "version": 2,
             "source_fingerprint": fingerprint,
-            "shard_size": shard_size,
+            "logical_shard_size": logical_shard_size,
+            "micro_shard_size": micro_shard_size,
+            "input_adapter": input_adapter,
         }
         for key, value in expected.items():
             if manifest.get(key) != value:
@@ -245,7 +303,7 @@ def build_input_shards(
         byte_count = 0
 
     try:
-        for line in iter_nonempty_lines(source_files):
+        for line in iter_nonempty_lines(source_files, input_adapter):
             if target is None:
                 index = len(shards)
                 target_tmp = (
@@ -259,7 +317,7 @@ def build_input_shards(
             rows += 1
             byte_count += len(line)
             total_rows += 1
-            if rows >= shard_size:
+            if rows >= micro_shard_size:
                 finish_shard()
         finish_shard()
     except BaseException:
@@ -272,13 +330,19 @@ def build_input_shards(
     if not shards:
         raise ValueError("input contains no non-empty JSONL records")
     manifest = {
-        "version": 1,
+        "version": 2,
         "source_fingerprint": fingerprint,
         "source_files": source_entries,
-        "shard_size": shard_size,
+        "logical_shard_size": logical_shard_size,
+        "micro_shard_size": micro_shard_size,
+        "input_adapter": input_adapter,
         "total_rows": total_rows,
         "shards": shards,
     }
+    micros_per_logical = logical_shard_size // micro_shard_size
+    for shard in manifest["shards"]:
+        shard["logical_index"] = shard["index"] // micros_per_logical
+        shard["micro_index"] = shard["index"] % micros_per_logical
     atomic_write_json(manifest_path, manifest)
     return manifest
 
@@ -451,7 +515,8 @@ def valid_success_marker(
     return (
         marker.get("version") == 1
         and marker.get("mode") == mode
-        and marker.get("shard_index") == shard["index"]
+        and marker.get("micro_shard_index") == shard["index"]
+        and marker.get("logical_shard_index") == shard["logical_index"]
         and marker.get("input_rows") == shard["rows"]
         and marker.get("input_sha256") == shard["sha256"]
     )
@@ -459,19 +524,52 @@ def valid_success_marker(
 
 def write_failure(
     failures_root: Path,
-    shard_index: int,
+    shard: Dict[str, Any],
     error: BaseException,
 ) -> None:
+    logical_index = shard["logical_index"]
+    micro_index = shard["micro_index"]
     atomic_write_json(
-        failures_root / f"shard-{shard_index:06d}",
+        failures_root
+        / f"shard-{logical_index:06d}-micro-{micro_index:04d}",
         {
             "version": 1,
-            "shard_index": shard_index,
+            "logical_shard_index": logical_index,
+            "micro_shard_index": shard["index"],
+            "micro_index_within_logical_shard": micro_index,
             "failed_at": datetime.now(timezone.utc).isoformat(),
             "error_type": type(error).__name__,
             "error": str(error),
         },
     )
+
+
+def write_logical_success(
+    output_root: Path,
+    mode: str,
+    logical_index: int,
+    logical_shards: Sequence[Dict[str, Any]],
+) -> bool:
+    logical_dir = output_root / f"shard-{logical_index:06d}"
+    markers = []
+    for shard in logical_shards:
+        micro_dir = logical_dir / f"micro-{shard['micro_index']:04d}"
+        if not valid_success_marker(micro_dir, mode, shard):
+            return False
+        markers.append(load_json(micro_dir / "SUCCESS"))
+    atomic_write_json(
+        logical_dir / "SUCCESS",
+        {
+            "version": 1,
+            "mode": mode,
+            "logical_shard_index": logical_index,
+            "micro_shards": len(logical_shards),
+            "input_rows": sum(item["input_rows"] for item in markers),
+            "output_rows": sum(item["output_rows"] for item in markers),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    return True
 
 
 def validate_cli_ownership(argv: Sequence[str]) -> None:
@@ -514,8 +612,29 @@ def main() -> None:
     parser.add_argument("--output-root", required=True, type=absolute_path)
     parser.add_argument("--cache-root", required=True, type=absolute_path)
     parser.add_argument("--work-root", type=absolute_path)
-    parser.add_argument("--shard-size", type=positive_int, default=100_000)
-    parser.add_argument("--shard-index", type=non_negative_int)
+    parser.add_argument(
+        "--logical-shard-size",
+        type=positive_int,
+        default=100_000,
+    )
+    parser.add_argument(
+        "--micro-shard-size",
+        "--shard-size",
+        dest="micro_shard_size",
+        type=positive_int,
+        default=10_000,
+    )
+    parser.add_argument(
+        "--logical-shard-index",
+        "--shard-index",
+        dest="logical_shard_index",
+        type=non_negative_int,
+    )
+    parser.add_argument(
+        "--input-adapter",
+        choices=["none", "purchased-selection"],
+        default="none",
+    )
     parser.add_argument(
         "--cache-zero-timeout",
         type=non_negative_int,
@@ -543,6 +662,11 @@ def main() -> None:
         parser.error(f"Python interpreter is not executable: {python}")
     if not pipeline_script.is_file():
         parser.error(f"pipeline script does not exist: {pipeline_script}")
+    if args.logical_shard_size % args.micro_shard_size != 0:
+        parser.error(
+            "--logical-shard-size must be an exact multiple of "
+            "--micro-shard-size"
+        )
     generated_roots = (output_root, cache_root, work_root)
     unsafe_roots = {Path("/"), Path.home().resolve()}
     if any(path in unsafe_roots for path in generated_roots):
@@ -577,7 +701,9 @@ def main() -> None:
         source_files,
         source_entries,
         fingerprint,
-        args.shard_size,
+        args.logical_shard_size,
+        args.micro_shard_size,
+        args.input_adapter,
         work_root,
         args.rebuild_input_shards,
     )
@@ -586,42 +712,76 @@ def main() -> None:
             if stale_output.is_dir():
                 safe_rmtree(stale_output, output_root)
     shards = manifest["shards"]
-    if args.shard_index is not None:
+    all_shards = shards
+    if args.logical_shard_index is not None:
         shards = [
             shard
             for shard in shards
-            if shard["index"] == args.shard_index
+            if shard["logical_index"] == args.logical_shard_index
         ]
         if not shards:
+            max_logical_index = all_shards[-1]["logical_index"]
             parser.error(
-                f"--shard-index {args.shard_index} is outside "
-                f"0..{len(manifest['shards']) - 1}"
+                f"--logical-shard-index {args.logical_shard_index} is "
+                f"outside 0..{max_logical_index}"
             )
+
+    selected_logical_indices = sorted(
+        {shard["logical_index"] for shard in shards}
+    )
+    for logical_index in selected_logical_indices:
+        logical_shards = [
+            shard
+            for shard in all_shards
+            if shard["logical_index"] == logical_index
+        ]
+        logical_dir = output_root / f"shard-{logical_index:06d}"
+        if not all(
+            valid_success_marker(
+                logical_dir / f"micro-{shard['micro_index']:04d}",
+                args.mode,
+                shard,
+            )
+            for shard in logical_shards
+        ):
+            (logical_dir / "SUCCESS").unlink(missing_ok=True)
 
     completed = 0
     skipped = 0
     for shard in shards:
         index = shard["index"]
-        shard_name = f"shard-{index:06d}"
-        final_dir = output_root / shard_name
-        failure_path = failures_root / shard_name
+        logical_index = shard["logical_index"]
+        micro_index = shard["micro_index"]
+        logical_name = f"shard-{logical_index:06d}"
+        micro_name = f"micro-{micro_index:04d}"
+        task_name = f"{logical_name}/{micro_name}"
+        logical_dir = output_root / logical_name
+        logical_dir.mkdir(parents=True, exist_ok=True)
+        final_dir = logical_dir / micro_name
+        failure_name = (
+            f"{logical_name}-micro-{micro_index:04d}"
+        )
+        failure_path = failures_root / failure_name
         if valid_success_marker(final_dir, args.mode, shard):
-            print(f"[skip] {shard_name}: valid SUCCESS")
+            print(f"[skip] {task_name}: valid SUCCESS", flush=True)
             skipped += 1
             continue
         if final_dir.exists():
-            safe_rmtree(final_dir, output_root)
+            safe_rmtree(final_dir, logical_dir)
 
-        for stale_attempt in attempts_root.glob(f"{shard_name}.*"):
+        attempt_prefix = (
+            f"shard-{logical_index:06d}-micro-{micro_index:04d}"
+        )
+        for stale_attempt in attempts_root.glob(f"{attempt_prefix}.*"):
             safe_rmtree(stale_attempt, attempts_root)
         attempt_dir = (
             attempts_root
-            / f"{shard_name}.{os.getpid()}.{uuid.uuid4().hex}"
+            / f"{attempt_prefix}.{os.getpid()}.{uuid.uuid4().hex}"
         )
         attempt_dir.mkdir()
         raw_output = attempt_dir / "ray_output.jsonl"
         normalized_output = attempt_dir / "data.jsonl"
-        shard_cache = cache_root / shard_name
+        shard_cache = cache_root / logical_name / micro_name
         shard_cache.mkdir(parents=True, exist_ok=True)
         expected_rows = expected_output_rows(
             args.mode,
@@ -641,8 +801,9 @@ def main() -> None:
             *pipeline_args,
         ]
         print(
-            f"[run] {shard_name}: input_rows={shard['rows']} "
-            f"expected_output_rows={expected_rows}"
+            f"[run] {task_name}: input_rows={shard['rows']} "
+            f"expected_output_rows={expected_rows}",
+            flush=True,
         )
         try:
             subprocess.run(command, cwd=REPOSITORY, check=True)
@@ -652,7 +813,7 @@ def main() -> None:
             )
             if output_rows != expected_rows:
                 raise RuntimeError(
-                    f"output row mismatch for {shard_name}: "
+                    f"output row mismatch for {task_name}: "
                     f"expected={expected_rows}, observed={output_rows}"
                 )
             usage = wait_for_zero_cache(
@@ -669,7 +830,9 @@ def main() -> None:
             marker = {
                 "version": 1,
                 "mode": args.mode,
-                "shard_index": index,
+                "logical_shard_index": logical_index,
+                "micro_shard_index": index,
+                "micro_index_within_logical_shard": micro_index,
                 "input_path": shard["path"],
                 "input_rows": shard["rows"],
                 "input_sha256": shard["sha256"],
@@ -682,7 +845,10 @@ def main() -> None:
             atomic_write_json(final_dir / "SUCCESS", marker)
             failure_path.unlink(missing_ok=True)
             completed += 1
-            print(f"[done] {shard_name}: {output_rows} rows")
+            print(
+                f"[done] {task_name}: {output_rows} rows",
+                flush=True,
+            )
         except BaseException as error:
             if attempt_dir.exists():
                 safe_rmtree(attempt_dir, attempts_root)
@@ -691,12 +857,28 @@ def main() -> None:
                 and not (final_dir / "SUCCESS").is_file()
             ):
                 safe_rmtree(final_dir, output_root)
-            write_failure(failures_root, index, error)
+            write_failure(failures_root, shard, error)
             print(
-                f"[failed] {shard_name}: {type(error).__name__}: {error}",
+                f"[failed] {task_name}: {type(error).__name__}: {error}",
                 file=sys.stderr,
+                flush=True,
             )
             raise
+
+    logical_completed = 0
+    for logical_index in selected_logical_indices:
+        logical_shards = [
+            shard
+            for shard in all_shards
+            if shard["logical_index"] == logical_index
+        ]
+        if write_logical_success(
+            output_root,
+            args.mode,
+            logical_index,
+            logical_shards,
+        ):
+            logical_completed += 1
 
     try:
         attempts_root.rmdir()
@@ -704,7 +886,10 @@ def main() -> None:
         pass
     print(
         f"shard run complete: completed={completed}, skipped={skipped}, "
-        f"selected={len(shards)}, total={len(manifest['shards'])}"
+        f"selected_micro_shards={len(shards)}, "
+        f"logical_shards_completed={logical_completed}, "
+        f"total_micro_shards={len(manifest['shards'])}",
+        flush=True,
     )
 
 

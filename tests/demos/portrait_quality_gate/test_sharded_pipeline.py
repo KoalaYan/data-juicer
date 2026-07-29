@@ -6,9 +6,11 @@ import unittest
 from pathlib import Path
 
 from demos.portrait_quality_gate.run_sharded_pipeline import (
+    adapt_input_record,
     expected_output_rows,
     stage2_record_is_selected,
 )
+from demos.portrait_quality_gate.show_sharded_progress import snapshot
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
@@ -76,6 +78,8 @@ if args.leave_cache_file:
             str(work_root),
             "--shard-size",
             "2",
+            "--logical-shard-size",
+            "4",
             "--cache-zero-timeout",
             "0",
         ]
@@ -110,8 +114,31 @@ if args.leave_cache_file:
                 text=True,
             )
             self.assertIn("completed=3, skipped=0", first.stdout)
-            for index, expected_rows in enumerate((2, 2, 1)):
-                shard_dir = output_root / f"shard-{index:06d}"
+            self.assertTrue(
+                (output_root / "shard-000000/SUCCESS").is_file()
+            )
+            self.assertTrue(
+                (output_root / "shard-000001/SUCCESS").is_file()
+            )
+            progress = snapshot(
+                output_root,
+                work_root,
+                cache_root,
+                None,
+            )
+            self.assertIn("logical shards: 2/2", progress)
+            self.assertIn("micro shards: 3/3", progress)
+            locations = (
+                (0, 0, 2),
+                (0, 1, 2),
+                (1, 0, 1),
+            )
+            for logical_index, micro_index, expected_rows in locations:
+                shard_dir = (
+                    output_root
+                    / f"shard-{logical_index:06d}"
+                    / f"micro-{micro_index:04d}"
+                )
                 marker = json.loads(
                     (shard_dir / "SUCCESS").read_text(encoding="utf-8")
                 )
@@ -124,7 +151,10 @@ if args.leave_cache_file:
                 })
                 self.assertTrue((shard_dir / "data.jsonl").is_file())
 
-            data_path = output_root / "shard-000001/data.jsonl"
+            data_path = (
+                output_root
+                / "shard-000000/micro-0001/data.jsonl"
+            )
             initial_mtime = data_path.stat().st_mtime_ns
             second = subprocess.run(
                 command,
@@ -135,15 +165,18 @@ if args.leave_cache_file:
             self.assertIn("completed=0, skipped=3", second.stdout)
             self.assertEqual(data_path.stat().st_mtime_ns, initial_mtime)
 
-            (output_root / "shard-000001/SUCCESS").unlink()
+            (
+                output_root
+                / "shard-000000/micro-0001/SUCCESS"
+            ).unlink()
             data_path.write_text('{"incomplete":true}\n', encoding="utf-8")
             rerun = subprocess.run(
-                [*command, "--shard-index", "1"],
+                [*command, "--logical-shard-index", "0"],
                 check=True,
                 capture_output=True,
                 text=True,
             )
-            self.assertIn("completed=1, skipped=0", rerun.stdout)
+            self.assertIn("completed=1, skipped=1", rerun.stdout)
             self.assertEqual(
                 len(data_path.read_text(encoding="utf-8").splitlines()),
                 2,
@@ -172,14 +205,25 @@ if args.leave_cache_file:
                 text=True,
             )
             self.assertNotEqual(result.returncode, 0)
-            self.assertFalse((output_root / "shard-000000").exists())
+            self.assertFalse(
+                (
+                    output_root
+                    / "shard-000000/micro-0000"
+                ).exists()
+            )
             attempts = output_root / ".attempts"
             self.assertEqual(list(attempts.iterdir()), [])
             self.assertTrue(
-                (work_root / "failures/shard-000000").is_file()
+                (
+                    work_root
+                    / "failures/shard-000000-micro-0000"
+                ).is_file()
             )
             self.assertTrue(
-                (cache_root / "shard-000000/orphan.jpg").is_file()
+                (
+                    cache_root
+                    / "shard-000000/micro-0000/orphan.jpg"
+                ).is_file()
             )
 
     def test_row_mismatch_prevents_success(self):
@@ -205,7 +249,12 @@ if args.leave_cache_file:
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("output row mismatch", result.stderr)
-            self.assertFalse((output_root / "shard-000000").exists())
+            self.assertFalse(
+                (
+                    output_root
+                    / "shard-000000/micro-0000"
+                ).exists()
+            )
 
     def test_stage2_expected_rows_matches_filter_rules(self):
         selected = {
@@ -251,6 +300,35 @@ if args.leave_cache_file:
                 ),
                 0,
             )
+
+    def test_purchased_selection_adapter_adds_data_juicer_fields(self):
+        source = {
+            "id": "sample-1",
+            "conversations": [
+                {"from": "human", "value": "portrait caption"},
+                {"from": "gpt", "value": "<image>"},
+            ],
+            "_sample": {
+                "image_uri": "s3://bucket/path/image.jpg",
+                "image_root": "s3://bucket/",
+                "source_meta": "s3://bucket/meta/source.jsonl",
+                "offset": 123,
+            },
+        }
+        adapted = json.loads(
+            adapt_input_record(
+                json.dumps(source).encode("utf-8"),
+                "purchased-selection",
+                Path("/input.jsonl"),
+                1,
+            )
+        )
+        self.assertEqual(
+            adapted["images"],
+            ["s3://bucket/path/image.jpg"],
+        )
+        self.assertEqual(adapted["text"], "portrait caption")
+        self.assertEqual(adapted["source_offset"], 123)
 
 
 if __name__ == "__main__":

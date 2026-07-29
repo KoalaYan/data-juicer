@@ -81,7 +81,7 @@ def main() -> None:
             "batch cannot hold all capacity while waiting for itself."
         ),
     )
-    parser.add_argument("--download-concurrency", type=positive_int, default=8)
+    parser.add_argument("--download-concurrency", type=positive_int, default=1)
     parser.add_argument("--score-batch-size", type=positive_int, default=4)
     parser.add_argument("--score-workers", type=positive_int, default=1)
     parser.add_argument("--input-size", type=positive_int, default=448)
@@ -163,6 +163,7 @@ def main() -> None:
                     "max_concurrent": args.download_concurrency,
                     "max_cache_files": args.max_cache_files,
                     "max_cache_bytes": args.max_cache_bytes,
+                    "fail_on_download_error": True,
                 }
             },
             {
