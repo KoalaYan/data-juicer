@@ -10,5 +10,7 @@ skip_op_error: false
 process:
   - image_portrait_quality_filter:
       keep_statuses: [pass, uncertain]
+      # Optionally keep only clear/strong human evidence:
+      # keep_human_statuses: [portrait_clear, human_present]
       any_or_all: all
       keep_missing: false

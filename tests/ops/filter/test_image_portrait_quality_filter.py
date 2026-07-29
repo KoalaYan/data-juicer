@@ -40,6 +40,28 @@ class ImagePortraitQualityFilterTest(DataJuicerTestCaseBase):
         }
         self.assertFalse(op.process_single(sample))
 
+    def test_can_filter_by_four_level_human_status(self):
+        op = ImagePortraitQualityFilter(
+            keep_human_statuses=["portrait_clear", "human_present"],
+        )
+        for human_status, expected in (
+            ("portrait_clear", True),
+            ("human_present", True),
+            ("human_uncertain", False),
+            ("no_human", False),
+        ):
+            sample = {
+                Fields.meta: {
+                    MetaKeys.portrait_quality: [
+                        {
+                            "status": "pass",
+                            "human_status": human_status,
+                        }
+                    ],
+                }
+            }
+            self.assertEqual(op.process_single(sample), expected)
+
 
 if __name__ == "__main__":
     unittest.main()

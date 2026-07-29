@@ -4,7 +4,7 @@ This demo performs conservative first-stage filtering for portrait raw data:
 
 - AOSS-backed `s3://...` materialization with source URI preservation;
 - near-black/near-white and severe exposure detection;
-- person presence from YOLO plus frontal-face fallback;
+- four-level portrait presence from YOLO person/pose plus frontal-face fallback;
 - background-only overexposure routed to `uncertain`;
 - viewer-compatible `conv.json` output for small-scale review.
 
@@ -47,12 +47,25 @@ information in output records.
 Each image receives a `__dj__meta__.portrait_quality` record with:
 
 - `status`: `pass`, `uncertain`, or `reject`;
+- `human_status`: `portrait_clear`, `human_present`, `human_uncertain`,
+  or `no_human`;
 - path-independent exposure and sharpness metrics;
-- person/face counts and detector confidence;
+- face area and face-region sharpness;
+- person/face counts, detector confidence, crop-edge diagnostics, and pose
+  keypoint completeness;
 - explicit `reject_reasons` and `warning_reasons`.
 
-Only high-confidence failures are rejected. Background-only overexposure and
-detector failures are marked `uncertain`.
+The human-presence levels mean:
+
+- `portrait_clear`: a sufficiently large, sharp, non-edge-clipped face;
+- `human_present`: strong complete person/pose evidence, including small,
+  occluded, or back-facing faces;
+- `human_uncertain`: low-confidence or suspiciously partial/cropped evidence;
+- `no_human`: no face, person, or pose evidence after all enabled detectors
+  completed.
+
+Only high-confidence failures are rejected. Partial bodies, suspicious crop,
+background-only overexposure, and detector failures are marked `uncertain`.
 
 ## Build a small review manifest
 

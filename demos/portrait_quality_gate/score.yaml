@@ -27,9 +27,19 @@ process:
   - image_portrait_quality_mapper:
       detect_people: true
       detect_faces_enabled: true
+      detect_pose: true
       require_human: true
       yolo_model_path: yolo11n.pt
+      yolo_pose_model_path: yolo11n-pose.pt
       person_confidence: 0.35
+      strong_person_confidence: 0.55
+      pose_confidence: 0.35
+      pose_keypoint_confidence: 0.35
+      min_pose_keypoints: 4
+      clear_face_area_ratio_min: 0.01
+      clear_face_sharpness_min: 20.0
+      edge_margin_ratio: 0.01
+      partial_person_width_height_ratio_min: 1.5
       max_analysis_side: 1024
       # Blur rejection is disabled until calibrated on project data.
       min_sharpness_score: 0.0

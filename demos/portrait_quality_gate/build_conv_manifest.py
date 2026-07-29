@@ -83,6 +83,7 @@ def format_annotation_text(
         f"Image URI: {image_uri}\n"
         f"Local image: {local_image}\n"
         f"Hard-quality status: {quality.get('status')}\n"
+        f"Human status: {quality.get('human_status')}\n"
         f"Reject reasons: {quality.get('reject_reasons', [])}\n"
         f"Warning reasons: {quality.get('warning_reasons', [])}\n"
         f"Person count: {quality.get('person_count')}\n"
@@ -102,8 +103,8 @@ def build_rows(
     image_key: str,
     source_image_key: str,
     configured_root: str,
-) -> Dict[Tuple[str, str], List[Dict[str, Any]]]:
-    groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+) -> Dict[Tuple[str, str, str], List[Dict[str, Any]]]:
+    groups: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
     for record_index, record in enumerate(records):
         meta = record.get(DJ_META_KEY) or record.get("meta") or {}
         quality_records = meta.get(QUALITY_KEY) or []
@@ -116,6 +117,7 @@ def build_rows(
             root_hint = configured_root or record.get("image_root") or record.get("root") or ""
             root, relative_image = split_root(str(image_uri), str(root_hint))
             status = quality.get("status", "unknown")
+            human_status = quality.get("human_status", "unknown")
             sample_id = record.get("id") or f"sample-{record_index:06d}"
             row = {
                 "id": f"{sample_id}::{image_index}",
@@ -127,6 +129,7 @@ def build_rows(
                 "source_meta": record.get("source_meta", record.get("__dj__source_file__")),
                 "source_offset": record.get("source_offset", record.get("offset")),
                 "hard_quality_status": status,
+                "human_status": human_status,
                 "reject_reasons": quality.get("reject_reasons", []),
                 "warning_reasons": quality.get("warning_reasons", []),
                 "portrait_quality": quality,
@@ -140,7 +143,7 @@ def build_rows(
                     {"from": "gpt", "value": "<image>"},
                 ],
             }
-            groups[(status, root)].append(row)
+            groups[(status, human_status, root)].append(row)
     return groups
 
 
@@ -157,16 +160,39 @@ def main() -> None:
     records = read_jsonl(args.input, args.limit)
     groups = build_rows(records, args.image_key, args.source_image_key, args.root)
     manifest = {}
-    summary = {"input_records": len(records), "images": 0, "by_status": {}}
+    summary = {
+        "input_records": len(records),
+        "images": 0,
+        "by_status": {},
+        "by_human_status": {},
+    }
     status_order = {"reject": 0, "uncertain": 1, "pass": 2, "unknown": 3}
+    human_status_order = {
+        "no_human": 0,
+        "human_uncertain": 1,
+        "human_present": 2,
+        "portrait_clear": 3,
+        "unknown": 4,
+    }
 
-    for group_index, ((status, root), rows) in enumerate(
-        sorted(groups.items(), key=lambda item: (status_order.get(item[0][0], 99), item[0][1]))
+    for group_index, ((status, human_status, root), rows) in enumerate(
+        sorted(
+            groups.items(),
+            key=lambda item: (
+                status_order.get(item[0][0], 99),
+                human_status_order.get(item[0][1], 99),
+                item[0][2],
+            ),
+        )
     ):
         rows.sort(key=lambda row: (row["reject_reasons"], row["warning_reasons"], row["id"]))
-        annotation_path = args.output_dir / "viewer_annotations" / f"{status}_{group_index:02d}.jsonl"
+        annotation_path = (
+            args.output_dir
+            / "viewer_annotations"
+            / f"{status}_{human_status}_{group_index:02d}.jsonl"
+        )
         count = atomic_jsonl(annotation_path, rows)
-        manifest[f"portrait_hard_quality_{status}_{group_index:02d}"] = {
+        manifest[f"portrait_hard_quality_{status}_{human_status}_{group_index:02d}"] = {
             "root": root,
             "annotation": str(annotation_path.resolve()),
             "length": count,
@@ -174,6 +200,9 @@ def main() -> None:
         }
         summary["images"] += count
         summary["by_status"][status] = summary["by_status"].get(status, 0) + count
+        summary["by_human_status"][human_status] = (
+            summary["by_human_status"].get(human_status, 0) + count
+        )
 
     atomic_json(args.output_dir / "conv.json", manifest)
     atomic_json(args.output_dir / "summary.json", summary)

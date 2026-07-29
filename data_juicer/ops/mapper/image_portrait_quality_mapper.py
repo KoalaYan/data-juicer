@@ -91,6 +91,44 @@ def _clip_box(
     return x1, y1, x2, y2
 
 
+def _box_metrics(
+    box: Sequence[float],
+    width: int,
+    height: int,
+    edge_margin_ratio: float,
+) -> Dict:
+    clipped = _clip_box(box, width, height)
+    if clipped is None:
+        return {
+            "area_ratio": 0.0,
+            "width_ratio": 0.0,
+            "height_ratio": 0.0,
+            "width_height_ratio": 0.0,
+            "touches_edges": [],
+        }
+    x1, y1, x2, y2 = clipped
+    box_width = x2 - x1
+    box_height = y2 - y1
+    x_margin = max(1, round(width * edge_margin_ratio))
+    y_margin = max(1, round(height * edge_margin_ratio))
+    touches_edges = []
+    if x1 <= x_margin:
+        touches_edges.append("left")
+    if y1 <= y_margin:
+        touches_edges.append("top")
+    if x2 >= width - x_margin:
+        touches_edges.append("right")
+    if y2 >= height - y_margin:
+        touches_edges.append("bottom")
+    return {
+        "area_ratio": float(box_width * box_height / max(1, width * height)),
+        "width_ratio": float(box_width / max(1, width)),
+        "height_ratio": float(box_height / max(1, height)),
+        "width_height_ratio": float(box_width / max(1, box_height)),
+        "touches_edges": touches_edges,
+    }
+
+
 @UNFORKABLE.register_module(OP_NAME)
 @TAGGING_OPS.register_module(OP_NAME)
 @OPERATORS.register_module(OP_NAME)
@@ -101,14 +139,15 @@ class ImagePortraitQualityMapper(Mapper):
     This lightweight mapper is intended for the first stage of portrait raw-data
     curation. It computes global, subject and background exposure metrics,
     gradient-based sharpness, and human-presence signals from a small YOLO person
-    detector plus an OpenCV frontal-face detector. Results are written to
-    ``meta.portrait_quality`` as one record per input image.
+    detector, an optional YOLO pose model, and an OpenCV frontal-face detector.
+    Results are written to ``meta.portrait_quality`` as one record per input
+    image.
 
-    The mapper emits ``pass``, ``uncertain`` or ``reject``. Only high-confidence
-    failures become ``reject``: near-black/near-white images, severe global or
-    subject overexposure, and no detected human when both detectors completed.
-    Background-only overexposure and detector failures remain ``uncertain`` for a
-    downstream VLM or human review.
+    Human presence is classified independently as ``portrait_clear``,
+    ``human_present``, ``human_uncertain`` or ``no_human``. The mapper also emits
+    an overall ``pass``, ``uncertain`` or ``reject`` hard-quality status. Only
+    high-confidence failures become ``reject``. Partial/cropped or low-confidence
+    human evidence remains ``uncertain`` for a downstream VLM or human review.
     """
 
     _accelerator = "cuda"
@@ -118,13 +157,23 @@ class ImagePortraitQualityMapper(Mapper):
         output_key: str = MetaKeys.portrait_quality,
         detect_people: bool = True,
         detect_faces_enabled: bool = True,
+        detect_pose: bool = False,
         require_human: bool = True,
         yolo_model_path: str = "yolo11n.pt",
+        yolo_pose_model_path: str = "yolo11n-pose.pt",
         yolo_image_size: int = 640,
         person_confidence: float = 0.35,
+        strong_person_confidence: float = 0.55,
+        pose_confidence: float = 0.35,
+        pose_keypoint_confidence: float = 0.35,
+        min_pose_keypoints: int = 4,
         face_classifier: str = "",
         face_scale_factor: float = 1.1,
         face_min_neighbors: int = 3,
+        clear_face_area_ratio_min: float = 0.01,
+        clear_face_sharpness_min: float = 20.0,
+        edge_margin_ratio: float = 0.01,
+        partial_person_width_height_ratio_min: float = 1.5,
         max_analysis_side: int = 1024,
         black_p99_max: float = 8.0,
         white_p01_min: float = 247.0,
@@ -140,19 +189,30 @@ class ImagePortraitQualityMapper(Mapper):
     ):
         kwargs.setdefault("memory", "1200MB")
         super().__init__(*args, **kwargs)
-        if require_human and not (detect_people or detect_faces_enabled):
+        if require_human and not (detect_people or detect_faces_enabled or detect_pose):
             raise ValueError("require_human=True needs at least one enabled human detector")
         if max_analysis_side < 64:
             raise ValueError("max_analysis_side must be at least 64")
+        if not 0 <= edge_margin_ratio < 0.5:
+            raise ValueError("edge_margin_ratio must be in [0, 0.5)")
 
         self.output_key = output_key
         self.detect_people = detect_people
         self.detect_faces_enabled = detect_faces_enabled
+        self.detect_pose = detect_pose
         self.require_human = require_human
         self.yolo_image_size = yolo_image_size
         self.person_confidence = person_confidence
+        self.strong_person_confidence = strong_person_confidence
+        self.pose_confidence = pose_confidence
+        self.pose_keypoint_confidence = pose_keypoint_confidence
+        self.min_pose_keypoints = min_pose_keypoints
         self.face_scale_factor = face_scale_factor
         self.face_min_neighbors = face_min_neighbors
+        self.clear_face_area_ratio_min = clear_face_area_ratio_min
+        self.clear_face_sharpness_min = clear_face_sharpness_min
+        self.edge_margin_ratio = edge_margin_ratio
+        self.partial_person_width_height_ratio_min = partial_person_width_height_ratio_min
         self.max_analysis_side = max_analysis_side
 
         self.black_p99_max = black_p99_max
@@ -168,6 +228,10 @@ class ImagePortraitQualityMapper(Mapper):
         self.person_model_key = None
         if self.detect_people:
             self.person_model_key = prepare_model(model_type="yolo", model_path=yolo_model_path)
+
+        self.pose_model_key = None
+        if self.detect_pose:
+            self.pose_model_key = prepare_model(model_type="yolo", model_path=yolo_pose_model_path)
 
         self.face_model_key = None
         if self.detect_faces_enabled:
@@ -188,6 +252,41 @@ class ImagePortraitQualityMapper(Mapper):
         confidences = prediction.boxes.conf.detach().cpu().numpy().tolist()
         return boxes, confidences
 
+    def _detect_poses(self, image, rank=None) -> List[Dict]:
+        model = get_model(self.pose_model_key, rank=rank, use_cuda=self.use_cuda())
+        prediction = model(
+            image,
+            imgsz=self.yolo_image_size,
+            conf=self.pose_confidence,
+            verbose=False,
+        )[0]
+        if prediction.keypoints is None:
+            return []
+        boxes = prediction.boxes.xyxy.detach().cpu().numpy().tolist()
+        confidences = prediction.boxes.conf.detach().cpu().numpy().tolist()
+        keypoints = prediction.keypoints.xy.detach().cpu().numpy().tolist()
+        if prediction.keypoints.conf is None:
+            keypoint_confidences = [
+                [1.0 if x != 0.0 or y != 0.0 else 0.0 for x, y in points]
+                for points in keypoints
+            ]
+        else:
+            keypoint_confidences = prediction.keypoints.conf.detach().cpu().numpy().tolist()
+        return [
+            {
+                "box_xyxy": box,
+                "confidence": confidence,
+                "keypoints_xy": points,
+                "keypoint_confidences": point_confidences,
+            }
+            for box, confidence, points, point_confidences in zip(
+                boxes,
+                confidences,
+                keypoints,
+                keypoint_confidences,
+            )
+        ]
+
     def _detect_faces(self, image) -> List[Tuple[int, int, int, int]]:
         model = get_model(self.face_model_key)
         detections = detect_faces(
@@ -205,6 +304,7 @@ class ImagePortraitQualityMapper(Mapper):
         person_boxes: List[Tuple[float, float, float, float]] = []
         person_confidences: List[float] = []
         face_boxes: List[Tuple[int, int, int, int]] = []
+        poses: List[Dict] = []
         detection_errors: List[str] = []
 
         if self.detect_people:
@@ -219,6 +319,12 @@ class ImagePortraitQualityMapper(Mapper):
             except Exception as e:
                 detection_errors.append(f"face_detector:{type(e).__name__}")
                 logger.warning(f"Portrait face detection failed: {e}")
+        if self.detect_pose:
+            try:
+                poses = self._detect_poses(image, rank=rank)
+            except Exception as e:
+                detection_errors.append(f"pose_detector:{type(e).__name__}")
+                logger.warning(f"Portrait pose detection failed: {e}")
 
         resized, scale_x, scale_y = _resize_for_analysis(image, self.max_analysis_side)
         rgb = np.asarray(resized.convert("RGB"), dtype=np.uint8)
@@ -242,6 +348,88 @@ class ImagePortraitQualityMapper(Mapper):
             for x, y, w, h in face_boxes
         ]
         all_subject_boxes = [box for box in scaled_person_boxes + scaled_face_boxes if box is not None]
+
+        person_metrics = []
+        for box, confidence in zip(person_boxes, person_confidences):
+            metrics = _box_metrics(
+                box,
+                original_width,
+                original_height,
+                self.edge_margin_ratio,
+            )
+            suspicious_partial = (
+                "top" in metrics["touches_edges"]
+                or metrics["width_height_ratio"] >= self.partial_person_width_height_ratio_min
+            )
+            person_metrics.append(
+                {
+                    **metrics,
+                    "confidence": float(confidence),
+                    "suspicious_partial": suspicious_partial,
+                }
+            )
+
+        face_quality = []
+        for original_box, scaled_box in zip(face_boxes, scaled_face_boxes):
+            if scaled_box is None:
+                continue
+            x, y, w, h = original_box
+            metrics = _box_metrics(
+                (x, y, x + w, y + h),
+                original_width,
+                original_height,
+                self.edge_margin_ratio,
+            )
+            x1, y1, x2, y2 = scaled_box
+            face_sharpness = _sharpness_score(luma[y1:y2, x1:x2])
+            clear = (
+                metrics["area_ratio"] >= self.clear_face_area_ratio_min
+                and face_sharpness >= self.clear_face_sharpness_min
+                and not metrics["touches_edges"]
+            )
+            face_quality.append(
+                {
+                    **metrics,
+                    "sharpness_score": face_sharpness,
+                    "clear": clear,
+                }
+            )
+
+        pose_quality = []
+        for pose in poses:
+            point_confidences = np.asarray(pose["keypoint_confidences"], dtype=np.float32)
+            valid = point_confidences >= self.pose_keypoint_confidence
+            valid_count = int(np.sum(valid))
+            head_count = int(np.sum(valid[:5]))
+            torso_count = int(np.sum(valid[[5, 6, 11, 12]])) if valid.size >= 13 else 0
+            metrics = _box_metrics(
+                pose["box_xyxy"],
+                original_width,
+                original_height,
+                self.edge_margin_ratio,
+            )
+            suspicious_partial = (
+                "top" in metrics["touches_edges"]
+                or metrics["width_height_ratio"] >= self.partial_person_width_height_ratio_min
+            )
+            confident_human = (
+                pose["confidence"] >= self.pose_confidence
+                and valid_count >= self.min_pose_keypoints
+                and (head_count >= 2 or torso_count >= 2)
+            )
+            pose_quality.append(
+                {
+                    **metrics,
+                    "confidence": float(pose["confidence"]),
+                    "valid_keypoint_count": valid_count,
+                    "head_keypoint_count": head_count,
+                    "torso_keypoint_count": torso_count,
+                    "confident_human": confident_human,
+                    "suspicious_partial": suspicious_partial,
+                    "keypoints_xy": pose["keypoints_xy"],
+                    "keypoint_confidences": pose["keypoint_confidences"],
+                }
+            )
 
         subject_mask = np.zeros(luma.shape, dtype=bool)
         for x1, y1, x2, y2 in all_subject_boxes:
@@ -270,14 +458,40 @@ class ImagePortraitQualityMapper(Mapper):
         if self.min_sharpness_score > 0 and sharpness < self.min_sharpness_score:
             reject_reasons.append("severe_blur")
 
-        human_found = bool(person_boxes or face_boxes)
-        enabled_detector_count = int(self.detect_people) + int(self.detect_faces_enabled)
+        human_evidence = bool(person_boxes or face_boxes or poses)
+        enabled_detector_count = int(self.detect_people) + int(self.detect_faces_enabled) + int(self.detect_pose)
         detection_complete = len(detection_errors) == 0 and enabled_detector_count > 0
-        if self.require_human and not human_found:
-            if detection_complete:
+
+        clear_face_found = any(face["clear"] for face in face_quality)
+        strong_complete_person = any(
+            person["confidence"] >= self.strong_person_confidence and not person["suspicious_partial"]
+            for person in person_metrics
+        )
+        strong_complete_pose = any(
+            pose["confident_human"] and not pose["suspicious_partial"] for pose in pose_quality
+        )
+        suspicious_partial_human = any(
+            item["suspicious_partial"] for item in person_metrics + pose_quality
+        )
+
+        if clear_face_found:
+            human_status = "portrait_clear"
+        elif face_quality or strong_complete_person or strong_complete_pose:
+            human_status = "human_present"
+        elif human_evidence or not detection_complete:
+            human_status = "human_uncertain"
+        else:
+            human_status = "no_human"
+
+        if self.require_human:
+            if human_status == "no_human":
                 reject_reasons.append("no_human")
-            else:
+            elif human_status == "human_uncertain":
                 warning_reasons.append("human_presence_uncertain")
+                if suspicious_partial_human:
+                    warning_reasons.append("partial_human_or_bad_crop")
+                if person_confidences and max(person_confidences) < self.strong_person_confidence:
+                    warning_reasons.append("low_confidence_human_detection")
 
         if (
             background_metrics["highlight_clip_ratio"] >= self.background_highlight_clip_min
@@ -296,8 +510,9 @@ class ImagePortraitQualityMapper(Mapper):
             status = "pass"
 
         return {
-            "version": 1,
+            "version": 2,
             "status": status,
+            "human_status": human_status,
             "reject_reasons": reject_reasons,
             "warning_reasons": warning_reasons,
             "width": original_width,
@@ -306,7 +521,7 @@ class ImagePortraitQualityMapper(Mapper):
             "person_count": len(person_boxes),
             "face_count": len(face_boxes),
             "max_person_confidence": float(max(person_confidences, default=0.0)),
-            "human_found": human_found,
+            "human_found": human_status != "no_human",
             "detection_complete": detection_complete,
             "detection_errors": detection_errors,
             "global_exposure": global_metrics,
@@ -314,6 +529,9 @@ class ImagePortraitQualityMapper(Mapper):
             "background_exposure": background_metrics,
             "person_boxes_xyxy": [[float(value) for value in box] for box in person_boxes],
             "face_boxes_xywh": [[int(value) for value in box] for box in face_boxes],
+            "person_quality": person_metrics,
+            "face_quality": face_quality,
+            "pose_quality": pose_quality,
         }
 
     def process_single(self, sample, rank=None, context=False):
