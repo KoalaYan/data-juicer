@@ -14,6 +14,15 @@ DJ_META_KEY = "__dj__meta__"
 QUALITY_KEY = "portrait_quality"
 
 
+def absolute_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise argparse.ArgumentTypeError(
+            f"path must be absolute, got: {value}"
+        )
+    return path
+
+
 def read_jsonl(path: Path, limit: int = 0) -> List[Dict[str, Any]]:
     records = []
     with path.open("r", encoding="utf-8") as source:
@@ -151,8 +160,13 @@ def build_rows(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, type=Path, help="Scored JSONL exported by Data-Juicer")
-    parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument(
+        "--input",
+        required=True,
+        type=absolute_path,
+        help="Scored JSONL exported by Data-Juicer",
+    )
+    parser.add_argument("--output-dir", required=True, type=absolute_path)
     parser.add_argument("--image-key", default="images", help="Local/cache image field")
     parser.add_argument("--source-image-key", default="source_images", help="Original URI field")
     parser.add_argument("--root", default="", help="Optional viewer root override")

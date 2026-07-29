@@ -18,6 +18,21 @@ if str(REPOSITORY) not in sys.path:
 
 from data_juicer.utils.cache_quota import FileCacheQuota  # noqa: E402
 
+
+DEFAULT_MODEL_CACHE = Path(
+    "/mnt/afs/yanpeishen/model_cache/huggingface"
+)
+
+
+def absolute_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise argparse.ArgumentTypeError(
+            f"path must be absolute, got: {value}"
+        )
+    return path
+
+
 def positive_int(value: str) -> int:
     result = int(value)
     if result <= 0:
@@ -37,13 +52,17 @@ def main() -> None:
     parser.add_argument(
         "--input",
         required=True,
-        type=Path,
+        type=absolute_path,
         help="Stage-1 output containing portrait_quality metadata.",
     )
-    parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--cache-root", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=absolute_path)
+    parser.add_argument("--cache-root", required=True, type=absolute_path)
     parser.add_argument("--model", default="KlingTeam/HumanAesExpert-8B")
-    parser.add_argument("--model-cache", required=True, type=Path)
+    parser.add_argument(
+        "--model-cache",
+        type=absolute_path,
+        default=DEFAULT_MODEL_CACHE,
+    )
     parser.add_argument("--max-cache-files", type=positive_int, default=256)
     parser.add_argument(
         "--max-cache-bytes",

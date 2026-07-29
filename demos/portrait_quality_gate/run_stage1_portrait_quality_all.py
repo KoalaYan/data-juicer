@@ -18,6 +18,24 @@ if str(REPOSITORY) not in sys.path:
 
 from data_juicer.utils.cache_quota import FileCacheQuota  # noqa: E402
 
+
+DEFAULT_YOLO_MODEL = Path(
+    "/mnt/afs/yanpeishen/.cache/data_juicer/models/yolo11n.pt"
+)
+DEFAULT_YOLO_POSE_MODEL = Path(
+    "/mnt/afs/yanpeishen/.cache/data_juicer/models/yolo11n-pose.pt"
+)
+
+
+def absolute_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise argparse.ArgumentTypeError(
+            f"path must be absolute, got: {value}"
+        )
+    return path
+
+
 def positive_int(value: str) -> int:
     result = int(value)
     if result <= 0:
@@ -34,9 +52,19 @@ def safe_cache_root(path: Path) -> Path:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, type=Path)
-    parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--cache-root", required=True, type=Path)
+    parser.add_argument("--input", required=True, type=absolute_path)
+    parser.add_argument("--output", required=True, type=absolute_path)
+    parser.add_argument("--cache-root", required=True, type=absolute_path)
+    parser.add_argument(
+        "--yolo-model",
+        type=absolute_path,
+        default=DEFAULT_YOLO_MODEL,
+    )
+    parser.add_argument(
+        "--yolo-pose-model",
+        type=absolute_path,
+        default=DEFAULT_YOLO_POSE_MODEL,
+    )
     parser.add_argument("--max-cache-files", type=positive_int, default=1024)
     parser.add_argument(
         "--max-cache-bytes",
@@ -65,8 +93,13 @@ def main() -> None:
     input_path = args.input.expanduser().resolve()
     output_path = args.output.expanduser().resolve()
     cache_root = safe_cache_root(args.cache_root)
+    yolo_model = args.yolo_model.resolve()
+    yolo_pose_model = args.yolo_pose_model.resolve()
     if input_path == output_path:
         parser.error("--input and --output must differ")
+    for model_path in (yolo_model, yolo_pose_model):
+        if not model_path.is_file():
+            parser.error(f"YOLO model does not exist: {model_path}")
     cache_root.mkdir(parents=True, exist_ok=True)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     FileCacheQuota(
@@ -117,8 +150,8 @@ def main() -> None:
                     "detect_faces_enabled": True,
                     "detect_pose": True,
                     "require_human": True,
-                    "yolo_model_path": "yolo11n.pt",
-                    "yolo_pose_model_path": "yolo11n-pose.pt",
+                    "yolo_model_path": str(yolo_model),
+                    "yolo_pose_model_path": str(yolo_pose_model),
                     "max_analysis_side": 1024,
                     "min_sharpness_score": 0.0,
                 }

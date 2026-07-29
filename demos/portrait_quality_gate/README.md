@@ -13,7 +13,7 @@ This demo performs conservative first-stage filtering for portrait raw data:
 The private AOSS config must only be supplied through the environment:
 
 ```bash
-export AOSS_CONF="/path/to/private/aoss.conf"
+export AOSS_CONF="/mnt/afs/private/path/to/aoss.conf"
 ```
 
 Do not add the config file, its contents, or credentials to YAML or Git.
@@ -124,6 +124,13 @@ review images should be downloaded again into a dedicated viewer cache.
 
 ## Two-stage full-dataset scoring
 
+The tested cluster interpreter is
+`/mnt/afs/yanpeishen/.conda/envs/portrait-hae-datajuicer/bin/python`.
+All dataset, output, cache, model-cache, and detector-model arguments must be
+absolute paths. The launchers below also use the absolute repository path
+`/mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer`; they deliberately
+do not hard-code the private `AOSS_CONF` path.
+
 `run_stage1_portrait_quality_all.py` annotates every input row and performs no
 filtering. Its Ray JSON output is therefore 1:1 with the source JSONL, while
 `images` is restored to the original S3 URI and
@@ -131,13 +138,12 @@ filtering. Its Ray JSON output is therefore 1:1 with the source JSONL, while
 presence results.
 
 ```bash
-export AOSS_CONF="/path/to/private/aoss.conf"
+export AOSS_CONF="/mnt/afs/private/path/to/aoss.conf"
 
-python demos/portrait_quality_gate/run_stage1_portrait_quality_all.py \
-  --input /path/to/raw.jsonl \
-  --output /path/to/stage1_portrait_quality.jsonl \
-  --cache-root /path/to/shared/afs/stage1-cache \
-  --ray-address auto \
+/mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer/demos/portrait_quality_gate/run_stage1_cluster.sh \
+  --input /mnt/afs/yanpeishen/datasets/raw.jsonl \
+  --output /mnt/afs/yanpeishen/results/stage1_portrait_quality.jsonl \
+  --cache-root /mnt/afs/yanpeishen/cache/portrait-stage1 \
   --max-cache-files 1024 \
   --max-cache-bytes 214748364800
 ```
@@ -149,13 +155,10 @@ and runs the official HumanAesExpert-8B Expert Head. Add
 first-stage hard-quality `reject` rows:
 
 ```bash
-python demos/portrait_quality_gate/run_stage2_humanaesexpert_12d.py \
-  --input /path/to/stage1_portrait_quality.jsonl \
-  --output /path/to/stage2_humanaesexpert_12d.jsonl \
-  --cache-root /path/to/shared/afs/stage2-cache \
-  --model-cache /path/to/huggingface-cache \
-  --ray-address auto \
-  --score-workers 8 \
+/mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer/demos/portrait_quality_gate/run_stage2_cluster_8h100.sh \
+  --input /mnt/afs/yanpeishen/results/stage1_portrait_quality.jsonl \
+  --output /mnt/afs/yanpeishen/results/stage2_humanaesexpert_12d.jsonl \
+  --cache-root /mnt/afs/yanpeishen/cache/portrait-stage2 \
   --max-cache-files 256 \
   --max-cache-bytes 107374182400
 ```
@@ -195,15 +198,10 @@ For the full run, the recommended high-throughput mode is a bounded fused
 pipeline:
 
 ```bash
-python demos/portrait_quality_gate/run_fused_portrait_humanaesexpert.py \
-  --input /path/to/raw.jsonl \
-  --output /path/to/portrait_quality_and_expert12d.jsonl \
-  --cache-root /path/to/shared/afs/fused-cache \
-  --model-cache /path/to/huggingface-cache \
-  --ray-address auto \
-  --quality-workers 4 \
-  --quality-gpus-per-worker 0.25 \
-  --score-workers 7 \
+/mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer/demos/portrait_quality_gate/run_fused_cluster_8h100.sh \
+  --input /mnt/afs/yanpeishen/datasets/raw.jsonl \
+  --output /mnt/afs/yanpeishen/results/portrait_quality_and_expert12d.jsonl \
+  --cache-root /mnt/afs/yanpeishen/cache/portrait-fused \
   --max-cache-files 2048 \
   --max-cache-bytes 214748364800
 ```
@@ -263,9 +261,10 @@ background-only overexposure, and detector failures are marked `uncertain`.
 ## Build a small review manifest
 
 ```bash
-python demos/portrait_quality_gate/build_conv_manifest.py \
-  --input ./outputs/portrait-hard-quality/scored.jsonl \
-  --output-dir ./outputs/portrait-hard-quality/viewer \
+/mnt/afs/yanpeishen/.conda/envs/portrait-hae-datajuicer/bin/python \
+  /mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer/demos/portrait_quality_gate/build_conv_manifest.py \
+  --input /mnt/afs/yanpeishen/results/portrait-hard-quality/scored.jsonl \
+  --output-dir /mnt/afs/yanpeishen/results/portrait-hard-quality/viewer \
   --limit 500
 ```
 
