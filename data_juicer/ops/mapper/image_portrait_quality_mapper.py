@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -156,6 +157,9 @@ class ImagePortraitQualityMapper(Mapper):
     def __init__(
         self,
         output_key: str = MetaKeys.portrait_quality,
+        delete_local_cache_after_processing: bool = False,
+        local_cache_root: str = "",
+        source_image_key: str = "source_images",
         detect_people: bool = True,
         detect_faces_enabled: bool = True,
         detect_pose: bool = False,
@@ -199,8 +203,20 @@ class ImagePortraitQualityMapper(Mapper):
             raise ValueError("inference_batch_size must be positive")
         if not 0 <= edge_margin_ratio < 0.5:
             raise ValueError("edge_margin_ratio must be in [0, 0.5)")
+        if delete_local_cache_after_processing and not local_cache_root:
+            raise ValueError(
+                "local_cache_root is required when "
+                "delete_local_cache_after_processing=True"
+            )
 
         self.output_key = output_key
+        self.delete_local_cache_after_processing = delete_local_cache_after_processing
+        self.local_cache_root = (
+            self._validate_cache_root(local_cache_root)
+            if delete_local_cache_after_processing
+            else ""
+        )
+        self.source_image_key = source_image_key
         self.detect_people = detect_people
         self.detect_faces_enabled = detect_faces_enabled
         self.detect_pose = detect_pose
@@ -243,6 +259,70 @@ class ImagePortraitQualityMapper(Mapper):
             if not face_classifier:
                 face_classifier = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_alt.xml")
             self.face_model_key = prepare_model(model_type="opencv_classifier", model_path=face_classifier)
+
+    @staticmethod
+    def _validate_cache_root(cache_root: str) -> str:
+        root = os.path.realpath(os.path.abspath(cache_root))
+        forbidden_roots = {
+            os.path.realpath(os.path.abspath(os.sep)),
+            os.path.realpath(os.path.expanduser("~")),
+        }
+        if root in forbidden_roots:
+            raise ValueError(f"Unsafe local_cache_root: {cache_root}")
+        return root
+
+    def _delete_cached_paths(self, paths) -> List[bool]:
+        deleted = []
+        for path in paths:
+            if not isinstance(path, str) or path.startswith("s3://"):
+                deleted.append(False)
+                continue
+            absolute_path = os.path.abspath(path)
+            resolved_path = os.path.realpath(absolute_path)
+            try:
+                inside_cache = os.path.commonpath(
+                    [self.local_cache_root, resolved_path]
+                ) == self.local_cache_root
+            except ValueError:
+                inside_cache = False
+            if not inside_cache or os.path.islink(absolute_path):
+                logger.warning(
+                    f"Refusing to delete path outside cache root or symlink: {path}"
+                )
+                deleted.append(False)
+                continue
+            try:
+                if os.path.isfile(absolute_path):
+                    os.remove(absolute_path)
+                    deleted.append(True)
+                else:
+                    deleted.append(False)
+            except OSError as e:
+                logger.warning(f"Failed to delete portrait cache file {path}: {e}")
+                deleted.append(False)
+        return deleted
+
+    def _cleanup_single_sample_cache(self, sample, local_paths):
+        if not self.delete_local_cache_after_processing:
+            return
+        if self.source_image_key not in sample:
+            raise ValueError(
+                f"{self.source_image_key!r} is required to restore remote image "
+                "URIs before deleting local cache files"
+            )
+        source_paths = sample[self.source_image_key]
+        if not isinstance(source_paths, list):
+            source_paths = [source_paths]
+        if len(source_paths) != len(local_paths):
+            raise ValueError(
+                "Source image paths and local cached image paths must have "
+                "the same length before cleanup"
+            )
+        deleted = self._delete_cached_paths(local_paths)
+        quality_records = (sample.get(Fields.meta) or {}).get(self.output_key) or []
+        for quality, was_deleted in zip(quality_records, deleted):
+            quality["local_cache_deleted"] = was_deleted
+        sample[self.image_key] = copy.deepcopy(sample[self.source_image_key])
 
     def _detect_people(self, image, rank=None) -> Tuple[List[Tuple[float, float, float, float]], List[float]]:
         model = get_model(self.person_model_key, rank=rank, use_cuda=self.use_cuda())
@@ -668,6 +748,7 @@ class ImagePortraitQualityMapper(Mapper):
         sample[Fields.meta][self.output_key] = [
             self._analyze_image(images[key], rank=rank) for key in loaded_image_keys
         ]
+        self._cleanup_single_sample_cache(sample, loaded_image_keys)
         return sample
 
     def process_batched(self, samples, rank=None, context=False):
@@ -734,4 +815,36 @@ class ImagePortraitQualityMapper(Mapper):
             samples[Fields.meta][sample_idx][self.output_key] = [
                 quality for _, quality in indexed_quality
             ]
+
+        if self.delete_local_cache_after_processing:
+            if self.source_image_key not in samples:
+                raise ValueError(
+                    f"{self.source_image_key!r} is required to restore remote "
+                    "image URIs before deleting local cache files"
+                )
+            for sample_idx in range(num_samples):
+                local_paths = (
+                    samples[self.image_key][sample_idx]
+                    if self.image_key in samples
+                    else []
+                )
+                if not isinstance(local_paths, list):
+                    local_paths = [local_paths]
+                source_paths = samples[self.source_image_key][sample_idx]
+                if not isinstance(source_paths, list):
+                    source_paths = [source_paths]
+                if len(source_paths) != len(local_paths):
+                    raise ValueError(
+                        "Source image paths and local cached image paths must "
+                        "have the same length before cleanup"
+                    )
+                deleted = self._delete_cached_paths(local_paths)
+                quality_records = (
+                    samples[Fields.meta][sample_idx].get(self.output_key) or []
+                )
+                for quality, was_deleted in zip(quality_records, deleted):
+                    quality["local_cache_deleted"] = was_deleted
+                samples[self.image_key][sample_idx] = copy.deepcopy(
+                    samples[self.source_image_key][sample_idx]
+                )
         return samples

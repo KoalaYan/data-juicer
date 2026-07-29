@@ -81,6 +81,34 @@ node-local and may be cleaned after reboot or by system policy. Production
 recipes should change `save_dir` to a persistent AFS path outside the Git
 repository. Do not store AOSS credentials in that directory or in YAML.
 
+## Streaming cleanup for very large datasets
+
+Do not use the default executor with a download-then-score recipe for hundreds
+of millions of images. The default executor materializes one operator over the
+dataset before starting the next operator, so local storage can fill before
+scoring begins.
+
+Use `score_streaming_cleanup.yaml` for production-scale runs. It:
+
+- uses Ray Data block streaming;
+- bounds the AOSS stage with explicit batch size and concurrency;
+- requires a shared AFS cache visible to download and GPU workers;
+- deletes each local image only after its person, pose, face, exposure, and
+  sharpness results have been produced;
+- refuses to delete paths outside the explicit `local_cache_root`, refuses
+  symlinks, and never recursively deletes directories;
+- restores `images` to the original `source_images` S3 URIs before export;
+- writes `local_cache_deleted` into each image's quality record.
+
+The cleanup root and S3 download `save_dir` must resolve to exactly the same
+directory. `/tmp` must not be used with a multi-node Ray cluster because it is
+node-local. If a task fails before cleanup, only in-flight batch files may
+remain; the next run reuses them through `resume_download`.
+
+For visualization, run a separate small sample with cleanup disabled. A
+full-scale output intentionally contains no durable local image path; selected
+review images should be downloaded again into a dedicated viewer cache.
+
 Each image receives a `__dj__meta__.portrait_quality` record with:
 
 - `status`: `pass`, `uncertain`, or `reject`;

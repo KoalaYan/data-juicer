@@ -1,4 +1,6 @@
 import io
+import os
+import tempfile
 import unittest
 
 import numpy as np
@@ -182,6 +184,57 @@ class ImagePortraitQualityMapperTest(DataJuicerTestCaseBase):
         )
         self.assertEqual(seen_sizes, [(1000, 500)])
         self.assertEqual(boxes, [(200, 100, 400, 200)])
+
+    def test_process_batched_deletes_only_cache_files_and_restores_s3_uris(self):
+        with tempfile.TemporaryDirectory() as cache_root:
+            local_paths = [
+                os.path.join(cache_root, "bucket", "a.jpg"),
+                os.path.join(cache_root, "bucket", "b.jpg"),
+            ]
+            for path in local_paths:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                Image.new("RGB", (64, 64), (128, 128, 128)).save(path)
+            source_paths = [
+                ["s3://bucket/a.jpg"],
+                ["s3://bucket/b.jpg"],
+            ]
+            op = ImagePortraitQualityMapper(
+                delete_local_cache_after_processing=True,
+                local_cache_root=cache_root,
+                source_image_key="source_images",
+                detect_people=False,
+                detect_faces_enabled=False,
+                detect_pose=False,
+                require_human=False,
+            )
+            result = op.process_batched(
+                {
+                    "text": ["first", "second"],
+                    "images": [[local_paths[0]], [local_paths[1]]],
+                    "source_images": source_paths,
+                    Fields.meta: [{}, {}],
+                }
+            )
+
+            self.assertEqual(result["images"], source_paths)
+            self.assertFalse(any(os.path.exists(path) for path in local_paths))
+            for meta in result[Fields.meta]:
+                quality = meta[MetaKeys.portrait_quality][0]
+                self.assertTrue(quality["local_cache_deleted"])
+
+    def test_cache_cleanup_refuses_file_outside_declared_root(self):
+        with tempfile.TemporaryDirectory() as cache_root:
+            with tempfile.NamedTemporaryFile() as outside:
+                op = ImagePortraitQualityMapper(
+                    delete_local_cache_after_processing=True,
+                    local_cache_root=cache_root,
+                    detect_people=False,
+                    detect_faces_enabled=False,
+                    detect_pose=False,
+                    require_human=False,
+                )
+                self.assertEqual(op._delete_cached_paths([outside.name]), [False])
+                self.assertTrue(os.path.isfile(outside.name))
 
 
 if __name__ == "__main__":

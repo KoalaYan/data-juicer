@@ -113,6 +113,8 @@ def build_rows(
 
         for image_index, quality in enumerate(quality_records):
             local_image = local_images[image_index] if image_index < len(local_images) else ""
+            if str(local_image).startswith("s3://"):
+                local_image = ""
             image_uri = source_images[image_index] if image_index < len(source_images) else local_image
             root_hint = configured_root or record.get("image_root") or record.get("root") or ""
             root, relative_image = split_root(str(image_uri), str(root_hint))

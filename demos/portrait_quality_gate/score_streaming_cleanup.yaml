@@ -1,0 +1,58 @@
+# Production-oriented streaming recipe for very large portrait datasets.
+# Replace all /path/to placeholders before running.
+project_name: portrait-hard-quality-streaming
+executor_type: ray
+dataset_path: /path/to/input.jsonl
+export_path: /path/to/output/selected.jsonl
+
+text_keys: text
+image_key: images
+image_bytes_key: image_bytes
+skip_op_error: false
+keep_stats_in_res_ds: true
+use_cache: false
+
+process:
+  - s3_download_file_mapper:
+      download_field: images
+      save_dir: /path/to/shared/afs/portrait-stream-cache
+      source_field: source_images
+      resume_download: true
+      preserve_s3_paths: true
+      s3_backend: aoss
+      aoss_config_env: AOSS_CONF
+      # Bound the number of downloaded-but-not-yet-scored files.
+      auto_op_parallelism: false
+      num_proc: 4
+      batch_size: 32
+      max_concurrent: 8
+
+  - image_portrait_quality_mapper:
+      num_gpus: 1
+      batch_size: 8
+      inference_batch_size: 8
+      delete_local_cache_after_processing: true
+      local_cache_root: /path/to/shared/afs/portrait-stream-cache
+      source_image_key: source_images
+      detect_people: true
+      detect_faces_enabled: true
+      detect_pose: true
+      require_human: true
+      yolo_model_path: yolo11n.pt
+      yolo_pose_model_path: yolo11n-pose.pt
+      person_confidence: 0.35
+      strong_person_confidence: 0.55
+      pose_confidence: 0.35
+      pose_keypoint_confidence: 0.35
+      min_pose_keypoints: 4
+      clear_face_area_ratio_min: 0.01
+      clear_face_sharpness_min: 20.0
+      edge_margin_ratio: 0.01
+      partial_person_width_height_ratio_min: 1.5
+      max_analysis_side: 1024
+      min_sharpness_score: 0.0
+
+  - image_portrait_quality_filter:
+      keep_statuses: [pass, uncertain]
+      any_or_all: all
+      keep_missing: false
