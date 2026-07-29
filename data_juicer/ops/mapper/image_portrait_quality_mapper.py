@@ -42,6 +42,7 @@ def _luminance(rgb: np.ndarray) -> np.ndarray:
 
 
 def _exposure_metrics(values: np.ndarray) -> Dict[str, float]:
+    values = np.asarray(values, dtype=np.float32)
     if values.size == 0:
         return {
             "mean": -1.0,

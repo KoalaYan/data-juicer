@@ -1,5 +1,5 @@
 import os
-import pickle
+import dill
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -39,7 +39,7 @@ class S3DownloadFileMapperTest(DataJuicerTestCaseBase):
             save_field="image_bytes",
             s3_backend="aoss",
         )
-        restored = pickle.loads(pickle.dumps(op))
+        restored = dill.loads(dill.dumps(op))
         self.assertEqual(restored.s3_backend, "aoss")
         self.assertIsNotNone(restored._thread_local)
 
@@ -54,7 +54,7 @@ class S3DownloadFileMapperTest(DataJuicerTestCaseBase):
                 s3_backend="aoss",
                 resume_download=True,
             )
-            op._thread_local.aoss_client = _FakeAOSSClient()
+            op._create_aoss_client = lambda: _FakeAOSSClient()
             samples = {"images": [["s3://infographics/a/b/example.jpg"]]}
             output = op.process_batched(samples)
             expected_path = os.path.join(tmpdir, "infographics", "a", "b", "example.jpg")
