@@ -1,0 +1,8 @@
+# HumanAesExpert-8B trusted remote-code runtime, validated on H100.
+# Torch and Torchvision remain cluster/CUDA-specific and are installed
+# separately in the portrait-hae-datajuicer environment.
+accelerate==0.33.0
+einops==0.8.2
+sentencepiece==0.2.0
+timm==0.6.7
+transformers==4.44.2

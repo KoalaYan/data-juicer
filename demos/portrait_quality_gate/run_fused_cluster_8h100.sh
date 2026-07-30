@@ -30,6 +30,8 @@ fi
 export DATA_JUICER_LAZY_OP_IMPORT=1
 export PYTHONPATH="${REPOSITORY}${PYTHONPATH:+:${PYTHONPATH}}"
 
+"${PYTHON}" "${POOL_MANAGER}" check
+
 ray_owned=0
 cleanup() {
   local exit_code=$?

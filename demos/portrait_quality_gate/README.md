@@ -302,6 +302,18 @@ PyArrow, Ultralytics, the internal AOSS client, Torch, and Torchvision remain
 importable on every node. The operator fails early on a version mismatch
 instead of producing unverified scores.
 
+Install the complete pinned HumanAesExpert remote-code dependency set with:
+
+```bash
+/mnt/afs/yanpeishen/.conda/envs/portrait-hae-datajuicer/bin/python \
+  -m pip install \
+  -r /mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer/demos/portrait_quality_gate/requirements-humanaesexpert.txt
+```
+
+The cluster launcher runs `manage_humanaesexpert_pool.py check` before
+starting Ray. It reports every missing or mismatched package together, so a
+dependency error does not first appear after seven GPU actors start warming.
+
 For the full run, the recommended high-throughput mode is a bounded fused
 pipeline:
 
