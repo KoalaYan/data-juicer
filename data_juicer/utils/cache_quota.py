@@ -100,6 +100,11 @@ class FileCacheQuota:
             for filename in filenames:
                 if directory == self.cache_root and filename in _CONTROL_NAMES:
                     continue
+                if _PARTIAL_FILE_PATTERN.search(filename):
+                    # In-flight downloads are private and bounded by producer
+                    # concurrency. Never treat one as a resumable ready file
+                    # or evict it while its owner reserves the final path.
+                    continue
                 path = os.path.realpath(os.path.join(directory, filename))
                 if not os.path.isfile(path) or os.path.islink(path):
                     continue

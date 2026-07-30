@@ -99,6 +99,23 @@ class FileCacheQuotaTest(unittest.TestCase):
             self.assertTrue(quota.acquire(second, 3))
             self.assertFalse(os.path.exists(first))
 
+    def test_initial_scan_ignores_active_partial_downloads(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = os.path.join(root, "image.jpg")
+            partial = f"{target}.part.123.456"
+            with open(partial, "wb") as output:
+                output.write(b"partial")
+            quota = FileCacheQuota(
+                root,
+                max_files=1,
+                max_bytes=1024,
+            )
+            self.assertTrue(quota.acquire(target, 16))
+            self.assertTrue(os.path.isfile(partial))
+            snapshot = quota.snapshot()
+            self.assertEqual(snapshot["files"], 1)
+            self.assertEqual(snapshot["bytes"], 16)
+
 
 if __name__ == "__main__":
     unittest.main()
