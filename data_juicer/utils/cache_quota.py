@@ -7,8 +7,10 @@ files and a downstream operator deletes them after successful processing.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
+import random
 import re
 import threading
 import time
@@ -66,7 +68,27 @@ class FileCacheQuota:
     @contextmanager
     def _locked(self):
         with open(self.lock_path, "a+", encoding="utf-8") as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            deadline = time.monotonic() + self.wait_timeout
+            delay = 0.01
+            while True:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                    break
+                except OSError as error:
+                    if error.errno not in (errno.EAGAIN, errno.EACCES):
+                        raise
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            "timed out acquiring file cache quota lock: "
+                            f"{self.lock_path}"
+                        ) from error
+                    sleep_for = min(
+                        remaining,
+                        delay + random.uniform(0.0, delay),
+                    )
+                    time.sleep(sleep_for)
+                    delay = min(0.25, delay * 2)
             try:
                 yield
             finally:

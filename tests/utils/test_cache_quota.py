@@ -1,11 +1,39 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from data_juicer.utils.cache_quota import FileCacheQuota
 
 
 class FileCacheQuotaTest(unittest.TestCase):
+
+    @patch(
+        "data_juicer.utils.cache_quota.random.uniform",
+        return_value=0.005,
+    )
+    @patch("data_juicer.utils.cache_quota.time.sleep")
+    @patch("data_juicer.utils.cache_quota.fcntl.flock")
+    def test_retries_transient_afs_lock_contention(
+        self,
+        flock,
+        sleep,
+        _uniform,
+    ):
+        flock.side_effect = [
+            BlockingIOError(11, "Resource temporarily unavailable"),
+            BlockingIOError(11, "Resource temporarily unavailable"),
+            None,
+            None,
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            quota = FileCacheQuota(root, max_files=1)
+            self.assertEqual(quota.snapshot()["files"], 0)
+        self.assertEqual(flock.call_count, 4)
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list],
+            [0.015, 0.025],
+        )
 
     def test_enforces_byte_limit_and_releases_capacity(self):
         with tempfile.TemporaryDirectory() as root:
