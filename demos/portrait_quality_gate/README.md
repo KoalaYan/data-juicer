@@ -228,12 +228,28 @@ export AOSS_CONF="/mnt/afs/private/path/to/aoss.conf"
 ```
 
 The development launcher uses its single H100 for both the quality process
-and one HumanAesExpert process by default. CPU quality remains available for
-experiments with `DIRECT_QUALITY_DEVICE=cpu`; its CPU budget is controlled by
-`DIRECT_QUALITY_CPU_THREADS`. It intentionally uses the exact same input
-manifest, output, work, and cache roots as the 8-H100 launcher. Consequently,
-either host validates and skips every 10,000-row micro-shard completed by the
-other host before loading models.
+and one HumanAesExpert process by default. Both models remain resident, but
+the development launcher schedules them in 2,000-row blocks: quality finishes
+the complete block before HAE starts consuming eligible images. Rejected
+images are deleted during quality routing; eligible images remain cached only
+until their HAE result is written. The defaults allow 2,500 cache files and
+40 GiB, so one block plus bounded download prefetch cannot grow without
+limit.
+
+Every completed block is stored under
+`micro-NNNN/blocks/block-NNNN/{quality.jsonl,data.jsonl,SUCCESS}`. A restart
+skips valid block markers, so at most one incomplete 2,000-row block is
+repeated. Five valid blocks are atomically concatenated into the existing
+10,000-row micro-shard `quality.jsonl` and `data.jsonl`; only then is the
+micro-shard `SUCCESS` written.
+
+CPU quality remains available for experiments with
+`DIRECT_QUALITY_DEVICE=cpu`; its CPU budget is controlled by
+`DIRECT_QUALITY_CPU_THREADS`. The development launcher intentionally uses the
+exact same input manifest, output, work, and cache roots as the 8-H100
+launcher. Consequently, either host validates and skips every completed
+10,000-row micro-shard before loading models. The 8-H100 launcher continues
+to use fused execution by default.
 
 The two launchers must not run simultaneously. Both acquire the atomic
 `DIRECT_PIPELINE_LOCK` directory under the shared AFS run root. The owner file

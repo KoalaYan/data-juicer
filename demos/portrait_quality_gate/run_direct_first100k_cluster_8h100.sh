@@ -129,6 +129,8 @@ echo "[run] cache_root=${CACHE_ROOT}"
 echo "[run] logical_shard=100000 micro_shard=10000 index=0"
 echo "[run] download_workers=${DIRECT_DOWNLOAD_WORKERS:-24}"
 echo "[run] score_workers=${DIRECT_SCORE_WORKERS:-7}"
+echo "[run] execution_mode=${DIRECT_EXECUTION_MODE:-fused}"
+echo "[run] stage_block_size=${DIRECT_STAGE_BLOCK_SIZE:-2000}"
 echo "[run] quality_device=${DIRECT_QUALITY_DEVICE:-cuda}"
 echo "[run] quality_cpu_threads=${DIRECT_QUALITY_CPU_THREADS:-16}"
 echo "[run] visible_gpu_tokens=${CUDA_VISIBLE_DEVICES}"
@@ -142,6 +144,8 @@ echo "[run] visible_gpu_tokens=${CUDA_VISIBLE_DEVICES}"
   --model-cache "${MODEL_CACHE}" \
   --logical-shard-size 100000 \
   --micro-shard-size 10000 \
+  --execution-mode "${DIRECT_EXECUTION_MODE:-fused}" \
+  --stage-block-size "${DIRECT_STAGE_BLOCK_SIZE:-2000}" \
   --logical-shard-index 0 \
   --download-workers "${DIRECT_DOWNLOAD_WORKERS:-24}" \
   --download-prefetch "${DIRECT_DOWNLOAD_PREFETCH:-96}" \

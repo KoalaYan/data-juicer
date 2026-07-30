@@ -8,10 +8,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from demos.portrait_quality_gate.run_direct_portrait_humanaesexpert import (
+    assemble_staged_micro,
     atomic_write_json,
+    atomic_write_jsonl,
     download_producer,
     jsonl_summary,
     resolve_worker_devices,
+    valid_block_success,
     valid_micro_success,
     write_logical_success,
 )
@@ -184,6 +187,88 @@ class DirectPortraitPipelineTest(unittest.TestCase):
             self.assertFalse(
                 (output_root / "shard-000000/SUCCESS").exists()
             )
+
+    def test_staged_blocks_assemble_and_validate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output_root = Path(temporary)
+            shard = {
+                "index": 0,
+                "logical_index": 0,
+                "micro_index": 0,
+                "rows": 3,
+                "sha256": "parent-input",
+                "path": "/input/micro.jsonl",
+            }
+            micro_dir = output_root / "shard-000000/micro-0000"
+            blocks_root = micro_dir / "blocks"
+            blocks_root.mkdir(parents=True)
+            for block_index, (block_start, rows) in enumerate(
+                ((0, 2), (2, 1))
+            ):
+                block_dir = blocks_root / f"block-{block_index:04d}"
+                block_dir.mkdir()
+                records = [
+                    {"id": block_start + offset}
+                    for offset in range(rows)
+                ]
+                quality_rows, quality_sha256 = atomic_write_jsonl(
+                    block_dir / "quality.jsonl",
+                    records,
+                )
+                output_rows, output_sha256 = atomic_write_jsonl(
+                    block_dir / "data.jsonl",
+                    records,
+                )
+                atomic_write_json(
+                    block_dir / "SUCCESS",
+                    {
+                        "version": 1,
+                        "mode": "direct-staged-block",
+                        "logical_shard_index": 0,
+                        "micro_shard_index": 0,
+                        "block_index": block_index,
+                        "block_start": block_start,
+                        "parent_input_sha256": "parent-input",
+                        "input_rows": rows,
+                        "quality_rows": quality_rows,
+                        "quality_sha256": quality_sha256,
+                        "output_rows": output_rows,
+                        "output_sha256": output_sha256,
+                        "elapsed_seconds": 1.0,
+                        "scored_rows": rows,
+                        "quality_only_rows": 0,
+                        "cache": {
+                            "files": 0,
+                            "bytes": 0,
+                            "references": 0,
+                            "partial_files": 0,
+                        },
+                    },
+                )
+                self.assertTrue(
+                    valid_block_success(
+                        block_dir,
+                        shard,
+                        block_index,
+                        block_start,
+                        rows,
+                    )
+                )
+
+            marker = assemble_staged_micro(
+                shard=shard,
+                micro_dir=micro_dir,
+                block_size=2,
+                cache={
+                    "files": 0,
+                    "bytes": 0,
+                    "references": 0,
+                    "partial_files": 0,
+                },
+            )
+            self.assertEqual(marker["blocks"], 2)
+            self.assertEqual(marker["output_rows"], 3)
+            self.assertTrue(valid_micro_success(micro_dir, shard))
 
 
 if __name__ == "__main__":

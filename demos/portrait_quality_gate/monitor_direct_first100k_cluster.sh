@@ -64,7 +64,7 @@ for log_file in "${LOG_FILE}" "${DEV_LOG_FILE}"; do
       /usr/bin/tail -c 200000 "${log_file}" \
         | /usr/bin/tr -d '\000' \
         | /usr/bin/grep -E \
-          '\[progress\]|\[micro-(start|done)\]|\[worker-ready\]|\[done\]|\[lock\]|Traceback|FAILED' \
+          '\[progress\]|\[block-(start|progress|done|skip)\]|\[micro-(start|done)\]|\[worker-ready\]|\[done\]|\[lock\]|Traceback|FAILED' \
         | /usr/bin/tail -n 50
     } || true
   else

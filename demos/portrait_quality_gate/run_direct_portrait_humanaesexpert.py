@@ -283,6 +283,7 @@ def quality_worker_main(
     device_token: str,
     quality_device: str,
     cpu_threads: int,
+    route_to_score: bool,
     input_queue: Any,
     score_queue: Any,
     result_queue: Any,
@@ -406,7 +407,14 @@ def quality_worker_main(
                     bool(result.get("humanaesexpert_eligible"))
                     for result in quality_records
                 ):
-                    score_queue.put(("record", sequence, record, metrics))
+                    if route_to_score:
+                        score_queue.put(
+                            ("record", sequence, record, metrics)
+                        )
+                    else:
+                        result_queue.put(
+                            ("ok", sequence, record, metrics)
+                        )
                 else:
                     record.setdefault(Fields.meta, {})[
                         MetaKeys.humanaesexpert_expert_scores
@@ -708,9 +716,9 @@ def valid_micro_success(
         output_rows, output_sha256 = jsonl_summary(data_path)
     except (OSError, ValueError, json.JSONDecodeError):
         return False
-    return (
+    valid = (
         marker.get("version") == 1
-        and marker.get("mode") == "direct-fused"
+        and marker.get("mode") in {"direct-fused", "direct-staged"}
         and marker.get("micro_shard_index") == shard["index"]
         and marker.get("logical_shard_index") == shard["logical_index"]
         and marker.get("input_rows") == shard["rows"]
@@ -723,6 +731,22 @@ def valid_micro_success(
         and marker.get("cache", {}).get("references") == 0
         and marker.get("cache", {}).get("partial_files") == 0
     )
+    if not valid:
+        return False
+    if marker.get("mode") == "direct-staged":
+        quality_path = micro_dir / "quality.jsonl"
+        if not quality_path.is_file():
+            return False
+        try:
+            quality_rows, quality_sha256 = jsonl_summary(quality_path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+        return (
+            marker.get("quality_rows") == quality_rows == shard["rows"]
+            and marker.get("quality_sha256") == quality_sha256
+            and marker.get("blocks", 0) > 0
+        )
+    return True
 
 
 def write_logical_success(
@@ -742,7 +766,7 @@ def write_logical_success(
         logical_dir / "SUCCESS",
         {
             "version": 1,
-            "mode": "direct-fused",
+            "mode": "direct",
             "logical_shard_index": logical_index,
             "micro_shards": len(logical_shards),
             "input_rows": sum(item["input_rows"] for item in markers),
@@ -827,6 +851,609 @@ def cache_snapshot(cache_root: Path) -> Dict[str, int]:
         "references": int(snapshot["references"]),
         "partial_files": partial_files,
     }
+
+
+def atomic_write_jsonl(
+    path: Path,
+    records: Sequence[Dict[str, Any]],
+) -> Tuple[int, str]:
+    temporary = path.with_name(
+        f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    )
+    hasher = hashlib.sha256()
+    rows = 0
+    with temporary.open("wb") as target:
+        for record in records:
+            encoded = (
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                + b"\n"
+            )
+            target.write(encoded)
+            hasher.update(encoded)
+            rows += 1
+        target.flush()
+        os.fsync(target.fileno())
+    os.replace(temporary, path)
+    return rows, hasher.hexdigest()
+
+
+def record_is_hae_eligible(record: Dict[str, Any]) -> bool:
+    from data_juicer.utils.constant import Fields, MetaKeys
+
+    quality_records = (
+        (record.get(Fields.meta) or {}).get(MetaKeys.portrait_quality)
+        or []
+    )
+    return any(
+        bool(result.get("humanaesexpert_eligible"))
+        for result in quality_records
+    )
+
+
+def quality_output_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    result = copy.deepcopy(record)
+    if result.get("source_images"):
+        result["images"] = copy.deepcopy(result["source_images"])
+    return result
+
+
+def valid_block_success(
+    block_dir: Path,
+    shard: Dict[str, Any],
+    block_index: int,
+    block_start: int,
+    block_rows: int,
+) -> bool:
+    marker_path = block_dir / "SUCCESS"
+    quality_path = block_dir / "quality.jsonl"
+    data_path = block_dir / "data.jsonl"
+    if not (
+        marker_path.is_file()
+        and quality_path.is_file()
+        and data_path.is_file()
+    ):
+        return False
+    try:
+        marker = load_json(marker_path)
+        quality_rows, quality_sha256 = jsonl_summary(quality_path)
+        output_rows, output_sha256 = jsonl_summary(data_path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return (
+        marker.get("version") == 1
+        and marker.get("mode") == "direct-staged-block"
+        and marker.get("logical_shard_index") == shard["logical_index"]
+        and marker.get("micro_shard_index") == shard["index"]
+        and marker.get("block_index") == block_index
+        and marker.get("block_start") == block_start
+        and marker.get("input_rows") == block_rows
+        and marker.get("parent_input_sha256") == shard["sha256"]
+        and marker.get("quality_rows") == quality_rows == block_rows
+        and marker.get("quality_sha256") == quality_sha256
+        and marker.get("output_rows") == output_rows == block_rows
+        and marker.get("output_sha256") == output_sha256
+        and marker.get("cache", {}).get("files") == 0
+        and marker.get("cache", {}).get("bytes") == 0
+        and marker.get("cache", {}).get("references") == 0
+        and marker.get("cache", {}).get("partial_files") == 0
+    )
+
+
+def process_staged_block(
+    *,
+    shard: Dict[str, Any],
+    block_index: int,
+    records: Sequence[Dict[str, Any]],
+    output_dir: Path,
+    downloader: DirectDownloader,
+    download_workers: int,
+    download_prefetch: int,
+    quality_queue: Any,
+    score_queue: Any,
+    result_queue: Any,
+    worker_processes: Sequence[mp.Process],
+    cache_root: Path,
+    progress_interval: float,
+    stall_timeout: float,
+) -> Dict[str, Any]:
+    producer_state: Dict[str, Any] = {
+        "done": False,
+        "dispatched": 0,
+        "fatal": None,
+    }
+    producer_stop = threading.Event()
+    producer = threading.Thread(
+        target=download_producer,
+        kwargs={
+            "records": records,
+            "download_one": downloader,
+            "workers": download_workers,
+            "max_pending": download_prefetch,
+            "quality_queue": quality_queue,
+            "result_queue": result_queue,
+            "state": producer_state,
+            "stop_event": producer_stop,
+            "cleanup_record": lambda record: safe_delete_cached_paths(
+                record,
+                str(cache_root),
+            ),
+        },
+        name=f"block-download-{shard['index']}-{block_index}",
+        daemon=True,
+    )
+    started = time.monotonic()
+    producer.start()
+
+    quality_results: List[Dict[str, Any] | None] = [None] * len(records)
+    quality_metrics: List[Dict[str, Any] | None] = [None] * len(records)
+    failures: List[Dict[str, Any]] = []
+    quality_received = 0
+    downloaded_bytes = 0
+    last_result = started
+    last_report = started
+    try:
+        while quality_received < len(records):
+            try:
+                status, sequence, payload, metrics = result_queue.get(
+                    timeout=5.0
+                )
+            except queue.Empty:
+                ensure_workers_alive(worker_processes)
+                if time.monotonic() - last_result > stall_timeout:
+                    raise TimeoutError(
+                        "staged quality phase made no record-level progress "
+                        f"for {stall_timeout:.0f}s"
+                    )
+                continue
+            if sequence < 0 or sequence >= len(records):
+                raise RuntimeError(
+                    f"invalid staged quality sequence: {sequence}"
+                )
+            if quality_results[sequence] is not None:
+                raise RuntimeError(
+                    f"duplicate staged quality sequence: {sequence}"
+                )
+            quality_received += 1
+            last_result = time.monotonic()
+            downloaded_bytes += int(metrics.get("download_bytes", 0))
+            if status == "ok":
+                quality_results[sequence] = payload
+                quality_metrics[sequence] = metrics
+            else:
+                quality_results[sequence] = {}
+                failures.append({"sequence": sequence, **payload})
+
+            now = time.monotonic()
+            if (
+                quality_received == len(records)
+                or now - last_report >= progress_interval
+            ):
+                elapsed = max(1e-6, now - started)
+                cache = cache_snapshot(cache_root)
+                print(
+                    "[block-progress] "
+                    f"micro={shard['index']} block={block_index} "
+                    f"phase=quality "
+                    f"completed={quality_received}/{len(records)} "
+                    f"rate={quality_received / elapsed:.2f}_images/s "
+                    f"queue={queue_size(quality_queue)} "
+                    f"cache_files={cache['files']} "
+                    f"cache_gib={cache['bytes'] / 1024**3:.2f}",
+                    flush=True,
+                )
+                last_report = now
+
+        producer.join(timeout=30.0)
+        if producer.is_alive():
+            raise RuntimeError("staged download producer did not stop")
+        if producer_state.get("fatal"):
+            failures.append(
+                {"sequence": -1, **producer_state["fatal"]}
+            )
+        if failures:
+            raise RuntimeError(
+                "staged quality phase failed: "
+                + json.dumps(failures[:3], ensure_ascii=False)
+            )
+
+        typed_quality_results = [
+            record
+            for record in quality_results
+            if record is not None
+        ]
+        if len(typed_quality_results) != len(records):
+            raise RuntimeError("staged quality result cardinality mismatch")
+        quality_elapsed = time.monotonic() - started
+        quality_rows, quality_sha256 = atomic_write_jsonl(
+            output_dir / "quality.jsonl",
+            [
+                quality_output_record(record)
+                for record in typed_quality_results
+            ],
+        )
+
+        eligible_sequences = [
+            sequence
+            for sequence, record in enumerate(typed_quality_results)
+            if record_is_hae_eligible(record)
+        ]
+        score_stop = threading.Event()
+
+        def dispatch_scores() -> None:
+            for sequence in eligible_sequences:
+                while not score_stop.is_set():
+                    try:
+                        score_queue.put(
+                            (
+                                "record",
+                                sequence,
+                                typed_quality_results[sequence],
+                                quality_metrics[sequence] or {},
+                            ),
+                            timeout=0.5,
+                        )
+                        break
+                    except queue.Full:
+                        continue
+
+        score_producer = threading.Thread(
+            target=dispatch_scores,
+            name=f"block-score-{shard['index']}-{block_index}",
+            daemon=True,
+        )
+        score_started = time.monotonic()
+        score_producer.start()
+        score_received = 0
+        last_result = score_started
+        last_report = score_started
+        scored_sequences: set[int] = set()
+        while score_received < len(eligible_sequences):
+            try:
+                status, sequence, payload, _ = result_queue.get(
+                    timeout=5.0
+                )
+            except queue.Empty:
+                ensure_workers_alive(worker_processes)
+                if time.monotonic() - last_result > stall_timeout:
+                    raise TimeoutError(
+                        "staged HAE phase made no record-level progress "
+                        f"for {stall_timeout:.0f}s"
+                    )
+                continue
+            if sequence not in eligible_sequences:
+                raise RuntimeError(
+                    f"unexpected staged HAE sequence: {sequence}"
+                )
+            if sequence in scored_sequences:
+                raise RuntimeError(
+                    f"duplicate staged HAE sequence: {sequence}"
+                )
+            scored_sequences.add(sequence)
+            score_received += 1
+            last_result = time.monotonic()
+            if status == "ok":
+                typed_quality_results[sequence] = payload
+            else:
+                failures.append({"sequence": sequence, **payload})
+
+            now = time.monotonic()
+            if (
+                score_received == len(eligible_sequences)
+                or now - last_report >= progress_interval
+            ):
+                elapsed = max(1e-6, now - score_started)
+                cache = cache_snapshot(cache_root)
+                print(
+                    "[block-progress] "
+                    f"micro={shard['index']} block={block_index} "
+                    f"phase=hae "
+                    f"completed={score_received}/"
+                    f"{len(eligible_sequences)} "
+                    f"rate={score_received / elapsed:.2f}_images/s "
+                    f"queue={queue_size(score_queue)} "
+                    f"cache_files={cache['files']} "
+                    f"cache_gib={cache['bytes'] / 1024**3:.2f}",
+                    flush=True,
+                )
+                last_report = now
+
+        score_producer.join(timeout=30.0)
+        if score_producer.is_alive():
+            raise RuntimeError("staged score producer did not stop")
+        if failures:
+            raise RuntimeError(
+                "staged HAE phase failed: "
+                + json.dumps(failures[:3], ensure_ascii=False)
+            )
+
+        cache = cache_snapshot(cache_root)
+        if (
+            cache["files"]
+            or cache["bytes"]
+            or cache["references"]
+            or cache["partial_files"]
+        ):
+            raise RuntimeError(
+                "cache is not empty after staged block: "
+                f"{json.dumps(cache, sort_keys=True)}"
+            )
+        output_rows, output_sha256 = atomic_write_jsonl(
+            output_dir / "data.jsonl",
+            typed_quality_results,
+        )
+        elapsed = time.monotonic() - started
+        return {
+            "quality_rows": quality_rows,
+            "quality_sha256": quality_sha256,
+            "output_rows": output_rows,
+            "output_sha256": output_sha256,
+            "elapsed_seconds": round(elapsed, 3),
+            "quality_elapsed_seconds": round(quality_elapsed, 3),
+            "score_elapsed_seconds": round(
+                time.monotonic() - score_started,
+                3,
+            ),
+            "images_per_second": round(
+                len(records) / max(elapsed, 1e-6),
+                4,
+            ),
+            "downloaded_bytes": downloaded_bytes,
+            "scored_rows": len(eligible_sequences),
+            "quality_only_rows": len(records) - len(eligible_sequences),
+            "cache": cache,
+        }
+    except BaseException:
+        producer_stop.set()
+        score_stop = locals().get("score_stop")
+        if score_stop is not None:
+            score_stop.set()
+        producer.join(timeout=60.0)
+        score_producer = locals().get("score_producer")
+        if score_producer is not None:
+            score_producer.join(timeout=60.0)
+        for record in quality_results:
+            if record:
+                safe_delete_cached_paths(record, str(cache_root))
+        raise
+
+
+def concatenate_jsonl(
+    sources: Sequence[Path],
+    target: Path,
+) -> Tuple[int, str]:
+    temporary = target.with_name(
+        f".{target.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    )
+    with temporary.open("wb") as output:
+        for source_path in sources:
+            with source_path.open("rb") as source:
+                shutil.copyfileobj(source, output)
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, target)
+    return jsonl_summary(target)
+
+
+def assemble_staged_micro(
+    *,
+    shard: Dict[str, Any],
+    micro_dir: Path,
+    block_size: int,
+    cache: Dict[str, int],
+) -> Dict[str, Any]:
+    blocks = []
+    for block_index, block_start in enumerate(
+        range(0, shard["rows"], block_size)
+    ):
+        block_rows = min(block_size, shard["rows"] - block_start)
+        block_dir = (
+            micro_dir / "blocks" / f"block-{block_index:04d}"
+        )
+        if not valid_block_success(
+            block_dir,
+            shard,
+            block_index,
+            block_start,
+            block_rows,
+        ):
+            raise RuntimeError(
+                f"cannot assemble invalid staged block: {block_dir}"
+            )
+        blocks.append((block_dir, load_json(block_dir / "SUCCESS")))
+
+    quality_rows, quality_sha256 = concatenate_jsonl(
+        [block_dir / "quality.jsonl" for block_dir, _ in blocks],
+        micro_dir / "quality.jsonl",
+    )
+    output_rows, output_sha256 = concatenate_jsonl(
+        [block_dir / "data.jsonl" for block_dir, _ in blocks],
+        micro_dir / "data.jsonl",
+    )
+    if quality_rows != shard["rows"] or output_rows != shard["rows"]:
+        raise RuntimeError(
+            "staged micro output cardinality mismatch: "
+            f"quality={quality_rows} output={output_rows} "
+            f"input={shard['rows']}"
+        )
+    summaries = [summary for _, summary in blocks]
+    elapsed = sum(
+        float(summary.get("elapsed_seconds", 0.0))
+        for summary in summaries
+    )
+    marker = {
+        "version": 1,
+        "mode": "direct-staged",
+        "logical_shard_index": shard["logical_index"],
+        "micro_shard_index": shard["index"],
+        "micro_index_within_logical_shard": shard["micro_index"],
+        "input_path": shard["path"],
+        "input_rows": shard["rows"],
+        "input_sha256": shard["sha256"],
+        "block_size": block_size,
+        "blocks": len(blocks),
+        "quality_rows": quality_rows,
+        "quality_sha256": quality_sha256,
+        "output_rows": output_rows,
+        "output_sha256": output_sha256,
+        "elapsed_seconds": round(elapsed, 3),
+        "images_per_second": round(
+            shard["rows"] / max(elapsed, 1e-6),
+            4,
+        ),
+        "downloaded_bytes": sum(
+            int(summary.get("downloaded_bytes", 0))
+            for summary in summaries
+        ),
+        "scored_rows": sum(
+            int(summary.get("scored_rows", 0))
+            for summary in summaries
+        ),
+        "quality_only_rows": sum(
+            int(summary.get("quality_only_rows", 0))
+            for summary in summaries
+        ),
+        "cache": cache,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    atomic_write_json(micro_dir / "SUCCESS", marker)
+    return marker
+
+
+def run_staged_micro(
+    *,
+    shard: Dict[str, Any],
+    records: Sequence[Dict[str, Any]],
+    final_dir: Path,
+    attempts_root: Path,
+    block_size: int,
+    downloader: DirectDownloader,
+    download_workers: int,
+    download_prefetch: int,
+    quality_queue: Any,
+    score_queue: Any,
+    result_queue: Any,
+    worker_processes: Sequence[mp.Process],
+    cache_root: Path,
+    progress_interval: float,
+    stall_timeout: float,
+) -> Dict[str, Any]:
+    final_dir.mkdir(parents=True, exist_ok=True)
+    blocks_root = final_dir / "blocks"
+    blocks_root.mkdir(exist_ok=True)
+    for incomplete_name in ("SUCCESS", "data.jsonl", "quality.jsonl"):
+        (final_dir / incomplete_name).unlink(missing_ok=True)
+
+    for block_index, block_start in enumerate(
+        range(0, len(records), block_size)
+    ):
+        block_records = records[block_start : block_start + block_size]
+        block_dir = blocks_root / f"block-{block_index:04d}"
+        if valid_block_success(
+            block_dir,
+            shard,
+            block_index,
+            block_start,
+            len(block_records),
+        ):
+            print(
+                "[block-skip] "
+                f"micro={shard['index']} block={block_index} "
+                f"rows={len(block_records)}",
+                flush=True,
+            )
+            continue
+        if block_dir.exists():
+            safe_rmtree(block_dir, blocks_root)
+        cache = cache_snapshot(cache_root)
+        if (
+            cache["files"]
+            or cache["bytes"]
+            or cache["references"]
+            or cache["partial_files"]
+        ):
+            cleanup_cache(cache_root)
+        attempt_dir = attempts_root / (
+            f"shard-{shard['logical_index']:06d}-"
+            f"micro-{shard['micro_index']:04d}-"
+            f"block-{block_index:04d}.{os.getpid()}."
+            f"{uuid.uuid4().hex}"
+        )
+        attempt_dir.mkdir()
+        print(
+            "[block-start] "
+            f"logical={shard['logical_index']} "
+            f"micro={shard['index']} block={block_index} "
+            f"start={block_start} rows={len(block_records)}",
+            flush=True,
+        )
+        try:
+            summary = process_staged_block(
+                shard=shard,
+                block_index=block_index,
+                records=block_records,
+                output_dir=attempt_dir,
+                downloader=downloader,
+                download_workers=download_workers,
+                download_prefetch=download_prefetch,
+                quality_queue=quality_queue,
+                score_queue=score_queue,
+                result_queue=result_queue,
+                worker_processes=worker_processes,
+                cache_root=cache_root,
+                progress_interval=progress_interval,
+                stall_timeout=stall_timeout,
+            )
+            marker = {
+                "version": 1,
+                "mode": "direct-staged-block",
+                "logical_shard_index": shard["logical_index"],
+                "micro_shard_index": shard["index"],
+                "micro_index_within_logical_shard": shard[
+                    "micro_index"
+                ],
+                "block_index": block_index,
+                "block_start": block_start,
+                "parent_input_sha256": shard["sha256"],
+                "input_rows": len(block_records),
+                **summary,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            }
+            atomic_write_json(attempt_dir / "SUCCESS", marker)
+            os.replace(attempt_dir, block_dir)
+            print(
+                "[block-done] "
+                f"micro={shard['index']} block={block_index} "
+                f"rate={summary['images_per_second']}_images/s "
+                f"scored={summary['scored_rows']}",
+                flush=True,
+            )
+        except BaseException:
+            if attempt_dir.exists():
+                safe_rmtree(attempt_dir, attempts_root)
+            cleanup_cache(cache_root)
+            raise
+
+    cache = cache_snapshot(cache_root)
+    if (
+        cache["files"]
+        or cache["bytes"]
+        or cache["references"]
+        or cache["partial_files"]
+    ):
+        raise RuntimeError(
+            "cache is not empty before staged micro assembly: "
+            f"{json.dumps(cache, sort_keys=True)}"
+        )
+    return assemble_staged_micro(
+        shard=shard,
+        micro_dir=final_dir,
+        block_size=block_size,
+        cache=cache,
+    )
 
 
 def process_micro_shard(
@@ -1065,6 +1692,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--logical-shard-size", type=positive_int, default=100_000)
     parser.add_argument("--micro-shard-size", type=positive_int, default=10_000)
     parser.add_argument(
+        "--execution-mode",
+        choices=("fused", "staged-block"),
+        default="fused",
+    )
+    parser.add_argument(
+        "--stage-block-size",
+        type=positive_int,
+        default=2_000,
+    )
+    parser.add_argument(
         "--logical-shard-index",
         type=non_negative_int,
     )
@@ -1177,6 +1814,15 @@ def main() -> None:
         )
     if args.progress_interval <= 0:
         raise ValueError("--progress-interval must be positive")
+    if (
+        args.execution_mode == "staged-block"
+        and args.max_cache_files
+        < args.stage_block_size + args.download_prefetch
+    ):
+        raise ValueError(
+            "staged-block mode requires --max-cache-files to be at least "
+            "--stage-block-size + --download-prefetch"
+        )
     required_gpus = args.score_workers + int(args.quality_device == "cuda")
     if required_gpus > 8:
         raise ValueError(
@@ -1303,6 +1949,7 @@ def main() -> None:
             "device_token": quality_token,
             "quality_device": args.quality_device,
             "cpu_threads": args.quality_cpu_threads,
+            "route_to_score": args.execution_mode == "fused",
             "input_queue": quality_queue,
             "score_queue": score_queue,
             "result_queue": result_queue,
@@ -1367,17 +2014,19 @@ def main() -> None:
             )
             final_dir = logical_dir / f"micro-{shard['micro_index']:04d}"
             logical_dir.mkdir(parents=True, exist_ok=True)
-            if final_dir.exists():
-                safe_rmtree(final_dir, logical_dir)
-            attempt_dir = (
-                attempts_root
-                / (
-                    f"shard-{shard['logical_index']:06d}-"
-                    f"micro-{shard['micro_index']:04d}."
-                    f"{os.getpid()}.{uuid.uuid4().hex}"
+            attempt_dir = None
+            if args.execution_mode == "fused":
+                if final_dir.exists():
+                    safe_rmtree(final_dir, logical_dir)
+                attempt_dir = (
+                    attempts_root
+                    / (
+                        f"shard-{shard['logical_index']:06d}-"
+                        f"micro-{shard['micro_index']:04d}."
+                        f"{os.getpid()}.{uuid.uuid4().hex}"
+                    )
                 )
-            )
-            attempt_dir.mkdir()
+                attempt_dir.mkdir()
             failure_path = failures_root / (
                 f"shard-{shard['logical_index']:06d}-"
                 f"micro-{shard['micro_index']:04d}.json"
@@ -1392,49 +2041,71 @@ def main() -> None:
                     Path(shard["path"]),
                     shard["rows"],
                 )
-                summary = process_micro_shard(
-                    shard=shard,
-                    output_path=attempt_dir / "data.jsonl",
-                    records=records,
-                    downloader=downloader,
-                    download_workers=args.download_workers,
-                    download_prefetch=args.download_prefetch,
-                    quality_queue=quality_queue,
-                    score_queue=score_queue,
-                    result_queue=result_queue,
-                    worker_processes=processes,
-                    cache_root=cache_root,
-                    progress_interval=args.progress_interval,
-                    stall_timeout=args.stall_timeout,
-                )
-                cache = cache_snapshot(cache_root)
-                if (
-                    cache["files"]
-                    or cache["bytes"]
-                    or cache["references"]
-                    or cache["partial_files"]
-                ):
-                    raise RuntimeError(
-                        "cache is not empty after micro-shard: "
-                        f"{json.dumps(cache, sort_keys=True)}"
+                if args.execution_mode == "staged-block":
+                    summary = run_staged_micro(
+                        shard=shard,
+                        records=records,
+                        final_dir=final_dir,
+                        attempts_root=attempts_root,
+                        block_size=args.stage_block_size,
+                        downloader=downloader,
+                        download_workers=args.download_workers,
+                        download_prefetch=args.download_prefetch,
+                        quality_queue=quality_queue,
+                        score_queue=score_queue,
+                        result_queue=result_queue,
+                        worker_processes=processes,
+                        cache_root=cache_root,
+                        progress_interval=args.progress_interval,
+                        stall_timeout=args.stall_timeout,
                     )
-                marker = {
-                    "version": 1,
-                    "mode": "direct-fused",
-                    "logical_shard_index": shard["logical_index"],
-                    "micro_shard_index": shard["index"],
-                    "micro_index_within_logical_shard": shard[
-                        "micro_index"
-                    ],
-                    "input_path": shard["path"],
-                    "input_rows": shard["rows"],
-                    "input_sha256": shard["sha256"],
-                    **summary,
-                    "cache": cache,
-                    "completed_at": datetime.now(timezone.utc).isoformat(),
-                }
-                atomic_write_json(attempt_dir / "SUCCESS", marker)
-                os.replace(attempt_dir, final_dir)
+                else:
+                    assert attempt_dir is not None
+                    summary = process_micro_shard(
+                        shard=shard,
+                        output_path=attempt_dir / "data.jsonl",
+                        records=records,
+                        downloader=downloader,
+                        download_workers=args.download_workers,
+                        download_prefetch=args.download_prefetch,
+                        quality_queue=quality_queue,
+                        score_queue=score_queue,
+                        result_queue=result_queue,
+                        worker_processes=processes,
+                        cache_root=cache_root,
+                        progress_interval=args.progress_interval,
+                        stall_timeout=args.stall_timeout,
+                    )
+                    cache = cache_snapshot(cache_root)
+                    if (
+                        cache["files"]
+                        or cache["bytes"]
+                        or cache["references"]
+                        or cache["partial_files"]
+                    ):
+                        raise RuntimeError(
+                            "cache is not empty after micro-shard: "
+                            f"{json.dumps(cache, sort_keys=True)}"
+                        )
+                    marker = {
+                        "version": 1,
+                        "mode": "direct-fused",
+                        "logical_shard_index": shard["logical_index"],
+                        "micro_shard_index": shard["index"],
+                        "micro_index_within_logical_shard": shard[
+                            "micro_index"
+                        ],
+                        "input_path": shard["path"],
+                        "input_rows": shard["rows"],
+                        "input_sha256": shard["sha256"],
+                        **summary,
+                        "cache": cache,
+                        "completed_at": datetime.now(
+                            timezone.utc
+                        ).isoformat(),
+                    }
+                    atomic_write_json(attempt_dir / "SUCCESS", marker)
+                    os.replace(attempt_dir, final_dir)
                 failure_path.unlink(missing_ok=True)
                 completed += 1
                 atomic_write_json(
@@ -1459,14 +2130,14 @@ def main() -> None:
                     flush=True,
                 )
             except BaseException as error:
-                if attempt_dir.exists():
+                if attempt_dir is not None and attempt_dir.exists():
                     safe_rmtree(attempt_dir, attempts_root)
                 cleanup_cache(cache_root)
                 atomic_write_json(
                     failure_path,
                     {
                         "version": 1,
-                        "mode": "direct-fused",
+                        "mode": f"direct-{args.execution_mode}",
                         "logical_shard_index": shard["logical_index"],
                         "micro_shard_index": shard["index"],
                         "micro_index_within_logical_shard": shard[
