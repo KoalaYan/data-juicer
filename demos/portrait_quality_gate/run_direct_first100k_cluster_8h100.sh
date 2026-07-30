@@ -129,6 +129,8 @@ echo "[run] cache_root=${CACHE_ROOT}"
 echo "[run] logical_shard=100000 micro_shard=10000 index=0"
 echo "[run] download_workers=${DIRECT_DOWNLOAD_WORKERS:-24}"
 echo "[run] score_workers=${DIRECT_SCORE_WORKERS:-7}"
+echo "[run] quality_device=${DIRECT_QUALITY_DEVICE:-cuda}"
+echo "[run] quality_cpu_threads=${DIRECT_QUALITY_CPU_THREADS:-16}"
 echo "[run] visible_gpu_tokens=${CUDA_VISIBLE_DEVICES}"
 
 "${PYTHON}" "${PIPELINE}" \
@@ -148,6 +150,8 @@ echo "[run] visible_gpu_tokens=${CUDA_VISIBLE_DEVICES}"
   --result-queue-size "${DIRECT_RESULT_QUEUE_SIZE:-512}" \
   --quality-batch-size "${DIRECT_QUALITY_BATCH_SIZE:-64}" \
   --quality-batch-wait "${DIRECT_QUALITY_BATCH_WAIT:-0.05}" \
+  --quality-device "${DIRECT_QUALITY_DEVICE:-cuda}" \
+  --quality-cpu-threads "${DIRECT_QUALITY_CPU_THREADS:-16}" \
   --score-workers "${DIRECT_SCORE_WORKERS:-7}" \
   --max-cache-files "${DIRECT_MAX_CACHE_FILES:-512}" \
   --max-cache-bytes "${DIRECT_MAX_CACHE_BYTES:-53687091200}" \

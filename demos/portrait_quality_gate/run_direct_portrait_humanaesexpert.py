@@ -191,6 +191,25 @@ def configure_gpu_worker(gpu_token: str) -> None:
     os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 
+def configure_cpu_worker(cpu_threads: int) -> None:
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.environ["DATA_JUICER_LAZY_OP_IMPORT"] = "1"
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ["OMP_NUM_THREADS"] = str(cpu_threads)
+    os.environ["MKL_NUM_THREADS"] = str(cpu_threads)
+
+
+def resolve_worker_devices(
+    score_workers: int,
+    quality_device: str,
+) -> Tuple[str, List[str]]:
+    quality_uses_cuda = quality_device == "cuda"
+    tokens = visible_gpu_tokens(score_workers + int(quality_uses_cuda))
+    if quality_uses_cuda:
+        return tokens[0], tokens[1:]
+    return "cpu", tokens
+
+
 def safe_delete_cached_paths(
     record: Dict[str, Any],
     cache_root: str,
@@ -261,7 +280,9 @@ def _merge_minimal_batch(
 
 
 def quality_worker_main(
-    gpu_token: str,
+    device_token: str,
+    quality_device: str,
+    cpu_threads: int,
     input_queue: Any,
     score_queue: Any,
     result_queue: Any,
@@ -272,7 +293,11 @@ def quality_worker_main(
     batch_size: int,
     batch_wait_seconds: float,
 ) -> None:
-    configure_gpu_worker(gpu_token)
+    use_cuda = quality_device == "cuda"
+    if use_cuda:
+        configure_gpu_worker(device_token)
+    else:
+        configure_cpu_worker(cpu_threads)
     try:
         import torch
 
@@ -284,8 +309,15 @@ def quality_worker_main(
         )
         from data_juicer.utils.constant import Fields, MetaKeys
         from data_juicer.utils.model_utils import get_model
+        from data_juicer.utils.process_utils import setup_worker_threads
 
-        torch.cuda.set_device(0)
+        if use_cuda:
+            torch.cuda.set_device(0)
+        else:
+            # get_model() normally constrains multiprocessing workers to one
+            # thread. Configure this dedicated CPU inference worker first so
+            # the two YOLO models can use the explicitly assigned CPU budget.
+            setup_worker_threads(num_threads=cpu_threads)
         quality = ImagePortraitQualityMapper(
             yolo_model_path=yolo_model,
             yolo_pose_model_path=yolo_pose_model,
@@ -296,21 +328,26 @@ def quality_worker_main(
             inference_batch_size=batch_size,
             max_analysis_side=1024,
             min_sharpness_score=0.0,
-            accelerator="cuda",
+            accelerator=quality_device,
             auto_op_parallelism=False,
         )
-        get_model(quality.person_model_key, rank=0, use_cuda=True)
-        get_model(quality.pose_model_key, rank=0, use_cuda=True)
+        get_model(quality.person_model_key, rank=0, use_cuda=use_cuda)
+        get_model(quality.pose_model_key, rank=0, use_cuda=use_cuda)
         router = ImagePortraitCacheRouterMapper(
             keep_human_statuses=sorted(PORTRAIT_STATUSES),
             local_cache_root=cache_root,
             source_image_key="source_images",
             auto_op_parallelism=False,
         )
-        ready_queue.put(("ready", "quality", gpu_token, None))
+        ready_queue.put(("ready", "quality", device_token, None))
     except BaseException as error:
         ready_queue.put(
-            ("error", "quality", gpu_token, error_payload("startup", error))
+            (
+                "error",
+                "quality",
+                device_token,
+                error_payload("startup", error),
+            )
         )
         return
 
@@ -1024,6 +1061,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--result-queue-size", type=positive_int, default=512)
     parser.add_argument("--quality-batch-size", type=positive_int, default=64)
     parser.add_argument(
+        "--quality-device",
+        choices=("cpu", "cuda"),
+        default="cuda",
+    )
+    parser.add_argument(
+        "--quality-cpu-threads",
+        type=positive_int,
+        default=16,
+        help="Torch/OMP threads used when --quality-device=cpu.",
+    )
+    parser.add_argument(
         "--quality-batch-wait",
         type=non_negative_float,
         default=0.05,
@@ -1114,10 +1162,10 @@ def main() -> None:
         )
     if args.progress_interval <= 0:
         raise ValueError("--progress-interval must be positive")
-    if args.score_workers + 1 > 8:
+    required_gpus = args.score_workers + int(args.quality_device == "cuda")
+    if required_gpus > 8:
         raise ValueError(
-            "this single-node layout supports at most 7 score workers "
-            "plus one quality GPU"
+            "this single-node layout supports at most 8 GPU workers in total"
         )
 
     input_path = args.input.resolve()
@@ -1223,7 +1271,10 @@ def main() -> None:
         )
         cleanup_cache(cache_root)
 
-    gpu_tokens = visible_gpu_tokens(args.score_workers + 1)
+    quality_token, score_gpu_tokens = resolve_worker_devices(
+        args.score_workers,
+        args.quality_device,
+    )
     context = mp.get_context("spawn")
     quality_queue = context.Queue(maxsize=args.download_queue_size)
     score_queue = context.Queue(maxsize=args.score_queue_size)
@@ -1234,7 +1285,9 @@ def main() -> None:
     quality_process = context.Process(
         target=quality_worker_main,
         kwargs={
-            "gpu_token": gpu_tokens[0],
+            "device_token": quality_token,
+            "quality_device": args.quality_device,
+            "cpu_threads": args.quality_cpu_threads,
             "input_queue": quality_queue,
             "score_queue": score_queue,
             "result_queue": result_queue,
@@ -1245,7 +1298,7 @@ def main() -> None:
             "batch_size": args.quality_batch_size,
             "batch_wait_seconds": args.quality_batch_wait,
         },
-        name="portrait-quality-gpu",
+        name=f"portrait-quality-{args.quality_device}",
     )
     processes.append(quality_process)
     for worker_index in range(args.score_workers):
@@ -1254,7 +1307,7 @@ def main() -> None:
                 target=score_worker_main,
                 kwargs={
                     "worker_index": worker_index,
-                    "gpu_token": gpu_tokens[worker_index + 1],
+                    "gpu_token": score_gpu_tokens[worker_index],
                     "input_queue": score_queue,
                     "result_queue": result_queue,
                     "ready_queue": ready_queue,

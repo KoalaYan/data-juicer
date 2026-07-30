@@ -9,9 +9,8 @@ if [[ ! -x "${CLUSTER_LAUNCHER}" ]]; then
   exit 1
 fi
 
-# The development host has one H100. Both long-lived child processes receive
-# that same physical GPU token; the 8-H100 launcher instead uses one distinct
-# token for quality and each of its seven scoring workers.
+# The development host has one H100. Keep it exclusive to HumanAesExpert and
+# run the lightweight portrait-quality models on the host CPUs.
 visible_devices="${CUDA_VISIBLE_DEVICES:-0}"
 dev_gpu_token="${DIRECT_DEV_GPU_TOKEN:-${visible_devices%%,*}}"
 if [[ -z "${dev_gpu_token}" ]]; then
@@ -19,9 +18,11 @@ if [[ -z "${dev_gpu_token}" ]]; then
   exit 1
 fi
 
-export CUDA_VISIBLE_DEVICES="${dev_gpu_token},${dev_gpu_token}"
+export CUDA_VISIBLE_DEVICES="${dev_gpu_token}"
 export DIRECT_LAUNCHER_ROLE=dev
 export DIRECT_SCORE_WORKERS=1
+export DIRECT_QUALITY_DEVICE=cpu
+export DIRECT_QUALITY_CPU_THREADS="${DIRECT_QUALITY_CPU_THREADS:-32}"
 export DIRECT_DOWNLOAD_WORKERS="${DIRECT_DOWNLOAD_WORKERS:-16}"
 export DIRECT_DOWNLOAD_PREFETCH="${DIRECT_DOWNLOAD_PREFETCH:-64}"
 export DIRECT_DOWNLOAD_QUEUE_SIZE="${DIRECT_DOWNLOAD_QUEUE_SIZE:-64}"

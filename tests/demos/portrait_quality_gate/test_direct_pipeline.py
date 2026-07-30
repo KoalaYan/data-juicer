@@ -5,17 +5,31 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from demos.portrait_quality_gate.run_direct_portrait_humanaesexpert import (
     atomic_write_json,
     download_producer,
     jsonl_summary,
+    resolve_worker_devices,
     valid_micro_success,
     write_logical_success,
 )
 
 
 class DirectPortraitPipelineTest(unittest.TestCase):
+
+    def test_resolve_worker_devices_keeps_cpu_quality_off_gpu(self):
+        with patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "3,5"}):
+            quality_token, score_tokens = resolve_worker_devices(2, "cpu")
+        self.assertEqual(quality_token, "cpu")
+        self.assertEqual(score_tokens, ["3", "5"])
+
+    def test_resolve_worker_devices_reserves_first_gpu_for_quality(self):
+        with patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "2,4,6"}):
+            quality_token, score_tokens = resolve_worker_devices(2, "cuda")
+        self.assertEqual(quality_token, "2")
+        self.assertEqual(score_tokens, ["4", "6"])
 
     def test_download_producer_is_bounded_and_dispatches_every_record(self):
         records = [{"id": index} for index in range(30)]
