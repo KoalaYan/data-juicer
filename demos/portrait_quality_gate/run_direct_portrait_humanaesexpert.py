@@ -318,6 +318,21 @@ def quality_worker_main(
             # thread. Configure this dedicated CPU inference worker first so
             # the two YOLO models can use the explicitly assigned CPU budget.
             setup_worker_threads(num_threads=cpu_threads)
+            # setup_worker_threads() may already have been called by an
+            # imported Data-Juicer module. set_num_threads() is safe to call
+            # again and makes the dedicated worker's CPU budget authoritative.
+            torch.set_num_threads(cpu_threads)
+            try:
+                torch.set_num_interop_threads(min(cpu_threads, 4))
+            except RuntimeError:
+                pass
+            print(
+                "[quality-runtime] "
+                f"device=cpu "
+                f"torch_threads={torch.get_num_threads()} "
+                f"torch_interop_threads={torch.get_num_interop_threads()}",
+                flush=True,
+            )
         quality = ImagePortraitQualityMapper(
             yolo_model_path=yolo_model,
             yolo_pose_model_path=yolo_pose_model,

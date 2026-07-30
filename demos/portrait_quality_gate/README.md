@@ -227,7 +227,7 @@ export AOSS_CONF="/mnt/afs/private/path/to/aoss.conf"
 /mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer/demos/portrait_quality_gate/run_direct_first100k_dev_1h100.sh
 ```
 
-The development launcher runs the quality process on CPU with 32 Torch/OMP
+The development launcher runs the quality process on CPU with 14 Torch/OMP
 threads by default and reserves its single H100 for HumanAesExpert. Override
 the CPU budget with `DIRECT_QUALITY_CPU_THREADS`. It intentionally uses the
 exact same input manifest, output, work, and cache roots as the 8-H100
