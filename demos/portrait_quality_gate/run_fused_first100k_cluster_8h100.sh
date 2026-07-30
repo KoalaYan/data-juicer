@@ -12,6 +12,26 @@ readonly CACHE_ROOT="/mnt/afs/yanpeishen/cache/data-juicer/human_baixing_0515_fu
 readonly LOG_FILE="${LOG_ROOT}/pipeline.log"
 readonly STATE_FILE="${LOG_ROOT}/pipeline.state"
 readonly PID_FILE="${LOG_ROOT}/pipeline.pid"
+readonly SCRIPT_NAME="${0##*/}"
+
+pipeline_pid_is_active() {
+  local pid="$1"
+  local process_state
+  local process_cmdline
+
+  [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
+  [[ -r "/proc/${pid}/stat" && -r "/proc/${pid}/cmdline" ]] || return 1
+
+  process_state="$(/usr/bin/awk '{print $3}' "/proc/${pid}/stat" 2>/dev/null || true)"
+  # kill -0 also succeeds for zombies. They cannot represent a live pipeline
+  # and must not leave the launcher permanently locked.
+  [[ -n "${process_state}" && "${process_state}" != "Z" && "${process_state}" != "X" ]] \
+    || return 1
+
+  process_cmdline="$(/usr/bin/tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)"
+  # A stale PID file may point to an unrelated process after PID reuse.
+  [[ "${process_cmdline}" == *"${SCRIPT_NAME}"* ]]
+}
 
 foreground=0
 if [[ "${1:-}" == "--foreground" ]]; then
@@ -35,12 +55,13 @@ done
 if [[ "${foreground}" -eq 0 ]]; then
   if [[ -s "${PID_FILE}" ]]; then
     existing_pid="$(<"${PID_FILE}")"
-    if [[ "${existing_pid}" =~ ^[0-9]+$ ]] \
-      && /bin/kill -0 "${existing_pid}" 2>/dev/null; then
+    if pipeline_pid_is_active "${existing_pid}"; then
       echo "Pipeline is already running with pid=${existing_pid}" >&2
       echo "Log: ${LOG_FILE}" >&2
       exit 1
     fi
+    echo "[stale] removing inactive, zombie, or reused pipeline pid=${existing_pid}" >&2
+    /bin/rm -f "${PID_FILE}"
   fi
   /usr/bin/nohup "$0" --foreground "$@" \
     >> "${LOG_FILE}" 2>&1 </dev/null &
