@@ -102,7 +102,21 @@ def main() -> None:
         help="Hard cache byte cap; default: 200 GiB.",
     )
     parser.add_argument("--download-workers", type=positive_int, default=8)
-    parser.add_argument("--download-concurrency", type=positive_int, default=1)
+    parser.add_argument(
+        "--download-batch-size",
+        type=positive_int,
+        default=8,
+        help="Rows per Ray download task; bounds head-of-line buffering.",
+    )
+    parser.add_argument(
+        "--download-concurrency",
+        type=positive_int,
+        default=4,
+        help=(
+            "Concurrent AOSS requests inside each Ray download task. Total "
+            "upper bound is download-workers times this value."
+        ),
+    )
     parser.add_argument("--aoss-download-attempts", type=positive_int, default=5)
     parser.add_argument(
         "--aoss-retry-initial-delay",
@@ -225,9 +239,10 @@ def main() -> None:
                     "preserve_s3_paths": True,
                     "s3_backend": "aoss",
                     "aoss_config_env": "AOSS_CONF",
+                    "aoss_stream_to_file": True,
                     "auto_op_parallelism": False,
                     "num_proc": args.download_workers,
-                    "batch_size": 1,
+                    "batch_size": args.download_batch_size,
                     "max_concurrent": args.download_concurrency,
                     "max_cache_files": args.max_cache_files,
                     "max_cache_bytes": args.max_cache_bytes,

@@ -180,6 +180,7 @@ def main() -> None:
                     "preserve_s3_paths": True,
                     "s3_backend": "aoss",
                     "aoss_config_env": "AOSS_CONF",
+                    "aoss_stream_to_file": True,
                     "auto_op_parallelism": False,
                     "num_proc": args.download_workers,
                     "batch_size": args.download_batch_size,

@@ -35,6 +35,7 @@ Tags 标签: cpu
 | `resume_download` | <class 'bool'> | `False` | Whether to resume download. If True, skip the sample if it exists. |
 | `timeout` | <class 'int'> | `30` | (Deprecated) Kept for backward compatibility, not used for S3 downloads. |
 | `max_concurrent` | <class 'int'> | `10` | Maximum concurrent downloads. |
+| `aoss_stream_to_file` | <class 'bool'> | `False` | Stream saved AOSS objects through `Client.download_file()` into a private temporary file before atomic publication. |
 | `aws_access_key_id` | <class 'str'> | `None` | AWS access key ID for S3. |
 | `aws_secret_access_key` | <class 'str'> | `None` | AWS secret access key for S3. |
 | `aws_session_token` | <class 'str'> | `None` | AWS session token for S3 (optional). |

@@ -178,12 +178,15 @@ aesthetics, and comprehensive aesthetics. The aggregate `score` is the
 as model diagnostics and must not be used directly as automatic deletion
 criteria.
 
-Both pipelines use a cross-process cache quota. Download workers reserve file
-and byte capacity before writing; after scoring, the consumer deletes the
+Both pipelines use a cross-process cache quota. AOSS downloads use
+`Client.download_file()` to stream into private temporary files, matching the
+previous 24-thread quality-labeling workflow, then acquire quota and
+atomically publish complete files. After scoring, the consumer deletes the
 local file and returns the reservation. When either limit is reached, new
-downloads wait while the GPU continues consuming completed items. Download
-batch size is fixed to one so a partially produced Ray batch cannot occupy the
-entire quota and deadlock itself. Duplicate S3 paths are reference-counted and
+downloads wait while the GPU continues consuming completed items. The number
+of temporary downloads is bounded by
+`download_workers * download_concurrency`; completed, published files remain
+bounded by both cache limits. Duplicate S3 paths are reference-counted and
 are deleted after their final in-flight consumer.
 
 ## Task-level shard checkpoints
@@ -263,15 +266,26 @@ export AOSS_CONF="/mnt/afs/private/path/to/aoss.conf"
 /mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer/demos/portrait_quality_gate/run_fused_first100k_cluster_8h100.sh
 ```
 
-The smoke launcher uses eight download workers with one in-flight request per
-single-sample batch. The installed AOSS client performs up to ten internal
-attempts without any delay. The download operator therefore adds five outer
-attempts for retryable system and connection failures, with exponential
-backoff starting at 1.5 seconds, capped at 12 seconds, plus up to one second
-of random jitter. Missing objects are not retried. A final download failure
-is raised in the download operator so the current micro-shard fails with its
-S3 URI instead of failing later during image decoding. These values can be
-changed with `--aoss-download-attempts`, `--aoss-retry-initial-delay`,
+This command is a background dispatcher: it starts the real launcher under
+`nohup`, writes its PID and state under the run's `logs` directory, prints the
+log-follow command, and exits. Re-running it on the same node refuses to start
+while the recorded PID is alive. The worker survives an SSH or terminal
+disconnect.
+
+The smoke launcher uses eight Ray download workers, batches of eight rows,
+and up to four AOSS requests inside each task, for a hard upper bound of 32
+in-flight downloads. Unlike the earlier slow path, it does not call
+`Client.get()` and then synchronously rewrite and `fsync` the full object.
+The installed AOSS client performs up to ten internal attempts without any
+delay. The download operator therefore adds five outer attempts for retryable
+system and connection failures, with exponential backoff starting at 1.5
+seconds, capped at 12 seconds, plus up to one second of random jitter. Missing
+objects are not retried. A final download failure is raised in the download
+operator so the current micro-shard fails with its S3 URI instead of failing
+later during image decoding. Concurrency can be tuned with
+`--download-workers`, `--download-batch-size`, and
+`--download-concurrency`; retries can be changed with
+`--aoss-download-attempts`, `--aoss-retry-initial-delay`,
 `--aoss-retry-max-delay`, and `--aoss-retry-jitter`.
 
 Monitor structured progress:
@@ -289,8 +303,15 @@ Monitor structured progress:
 Monitor the full pipeline log:
 
 ```bash
-/usr/bin/tail -F \
+/usr/bin/tail -n 200 -F \
   /mnt/afs/yanpeishen/project/t2i/purchased-data-governance/results/portrait_quality_gate/human_baixing_0515_fused_first100k_micro10k_20260729/logs/pipeline.log
+```
+
+Inspect the background launcher state and PID:
+
+```bash
+cat /mnt/afs/yanpeishen/project/t2i/purchased-data-governance/results/portrait_quality_gate/human_baixing_0515_fused_first100k_micro10k_20260729/logs/pipeline.state
+cat /mnt/afs/yanpeishen/project/t2i/purchased-data-governance/results/portrait_quality_gate/human_baixing_0515_fused_first100k_micro10k_20260729/logs/pipeline.pid
 ```
 
 ## One-download fused mode on 8 H100s
@@ -346,6 +367,9 @@ pipeline:
   --work-root /mnt/afs/yanpeishen/work/portrait-fused \
   --logical-shard-size 100000 \
   --micro-shard-size 10000 \
+  --download-workers 8 \
+  --download-batch-size 8 \
+  --download-concurrency 4 \
   --max-cache-files 2048 \
   --max-cache-bytes 214748364800
 ```

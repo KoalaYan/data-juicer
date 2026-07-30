@@ -61,6 +61,7 @@ class S3DownloadFileMapper(Mapper):
         cache_quota_wait_timeout: float = 1800.0,
         cache_quota_poll_interval: float = 1.0,
         fail_on_download_error: bool = False,
+        aoss_stream_to_file: bool = False,
         aoss_max_attempts: int = 5,
         aoss_retry_initial_delay: float = 1.5,
         aoss_retry_max_delay: float = 12.0,
@@ -103,6 +104,11 @@ class S3DownloadFileMapper(Mapper):
         :param fail_on_download_error: Raise immediately after a download
             batch contains failed objects instead of passing their remote URI
             to downstream operators.
+        :param aoss_stream_to_file: When saving AOSS objects without returning
+            their bytes, use the client's ``download_file`` implementation
+            instead of reading the whole object into Python memory first.
+            The object is downloaded to a private temporary path and
+            atomically published after cache quota has been acquired.
         :param aoss_max_attempts: Maximum outer attempts for one AOSS object.
             The outer retry adds delays because the internal AOSS retries do
             not wait between attempts.
@@ -159,6 +165,7 @@ class S3DownloadFileMapper(Mapper):
         self.cache_quota_wait_timeout = float(cache_quota_wait_timeout)
         self.cache_quota_poll_interval = float(cache_quota_poll_interval)
         self.fail_on_download_error = fail_on_download_error
+        self.aoss_stream_to_file = bool(aoss_stream_to_file)
         if aoss_max_attempts < 1:
             raise ValueError("aoss_max_attempts must be positive")
         if aoss_retry_initial_delay < 0:
@@ -378,10 +385,82 @@ class S3DownloadFileMapper(Mapper):
                 time.sleep(delay)
         raise AssertionError("unreachable AOSS retry state")
 
+    def _download_aoss_file_with_retries(
+        self,
+        s3_url: str,
+        temporary_path: str,
+    ) -> None:
+        for attempt in range(1, self.aoss_max_attempts + 1):
+            try:
+                if os.path.isfile(temporary_path):
+                    os.remove(temporary_path)
+                self.aoss_client.download_file(s3_url, temporary_path)
+                if (
+                    not os.path.isfile(temporary_path)
+                    or os.path.getsize(temporary_path) <= 0
+                ):
+                    raise IOError(
+                        f"AOSS produced an empty file for {s3_url}"
+                    )
+                return
+            except Exception as error:
+                if os.path.isfile(temporary_path):
+                    os.remove(temporary_path)
+                retryable = self._is_retryable_aoss_error(error)
+                if not retryable or attempt == self.aoss_max_attempts:
+                    raise
+                base_delay = min(
+                    self.aoss_retry_max_delay,
+                    self.aoss_retry_initial_delay * (2 ** (attempt - 1)),
+                )
+                delay = base_delay + random.uniform(
+                    0.0,
+                    self.aoss_retry_jitter,
+                )
+                logger.warning(
+                    "Retryable AOSS file download failure for {} "
+                    "(attempt {}/{}): {}. Retrying in {:.2f}s",
+                    s3_url,
+                    attempt,
+                    self.aoss_max_attempts,
+                    error,
+                    delay,
+                )
+                time.sleep(delay)
+        raise AssertionError("unreachable AOSS file retry state")
+
     def _download_from_aoss(self, s3_url: str, save_path: str = None, return_content: bool = False):
         reservation_owned = False
         temporary_path = None
         try:
+            if (
+                save_path
+                and not return_content
+                and self.aoss_stream_to_file
+            ):
+                save_parent = osp.dirname(save_path)
+                if save_parent:
+                    os.makedirs(save_parent, exist_ok=True)
+                temporary_path = self._temporary_save_path(save_path)
+                self._download_aoss_file_with_retries(
+                    s3_url,
+                    temporary_path,
+                )
+                if self._cache_quota is not None:
+                    reservation_owned = self._cache_quota.acquire(
+                        save_path,
+                        os.path.getsize(temporary_path),
+                    )
+                    if not reservation_owned:
+                        os.remove(temporary_path)
+                        temporary_path = None
+                        return "success", None, None, save_path
+                os.replace(temporary_path, save_path)
+                temporary_path = None
+                if self._cache_quota is not None:
+                    self._cache_quota.mark_ready(save_path)
+                return "success", None, None, save_path
+
             content = self._read_from_aoss_with_retries(s3_url)
 
             if save_path:

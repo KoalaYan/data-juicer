@@ -9,8 +9,18 @@ from data_juicer.utils.unittest_utils import DataJuicerTestCaseBase
 
 
 class _FakeAOSSClient:
+    def __init__(self):
+        self.get_calls = 0
+        self.download_file_calls = 0
+
     def get(self, url):
+        self.get_calls += 1
         return f"content:{url}".encode()
+
+    def download_file(self, url, path):
+        self.download_file_calls += 1
+        with open(path, "wb") as target:
+            target.write(f"streamed:{url}".encode())
 
 
 class _FailingAOSSClient:
@@ -86,6 +96,35 @@ class S3DownloadFileMapperTest(DataJuicerTestCaseBase):
             self.assertEqual(output["source_images"], [["s3://infographics/a/b/example.jpg"]])
             self.assertEqual(output["images"], [[expected_path]])
             self.assertTrue(os.path.isfile(expected_path))
+
+    @patch.dict(os.environ, {"AOSS_CONF": "/private/runtime/aoss.conf"})
+    def test_aoss_can_stream_directly_to_atomic_cache_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = _FakeAOSSClient()
+            op = S3DownloadFileMapper(
+                download_field="images",
+                save_dir=tmpdir,
+                preserve_s3_paths=True,
+                s3_backend="aoss",
+                aoss_stream_to_file=True,
+                resume_download=True,
+                max_cache_files=1,
+                max_cache_bytes=1024,
+            )
+            op._create_aoss_client = lambda: client
+            uri = "s3://infographics/a/b/streamed.jpg"
+            output = op.process_batched({"images": [[uri]]})
+            cache_path = output["images"][0][0]
+            with open(cache_path, "rb") as source:
+                self.assertEqual(
+                    source.read(),
+                    b"streamed:s3://infographics/a/b/streamed.jpg",
+                )
+            self.assertEqual(client.download_file_calls, 1)
+            self.assertEqual(client.get_calls, 0)
+            self.assertFalse(
+                any(".part." in name for name in os.listdir(tmpdir))
+            )
 
     @patch.dict(os.environ, {"AOSS_CONF": "/private/runtime/aoss.conf"})
     def test_resume_download_reuses_existing_file_without_aoss_request(self):
