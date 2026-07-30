@@ -5,7 +5,6 @@ import math
 import os
 from typing import Dict, List, Sequence, Tuple
 
-import numpy as np
 from loguru import logger
 from PIL import Image, ImageFile
 
@@ -18,12 +17,13 @@ from data_juicer.utils.lazy_loader import LazyLoader
 from ..base_op import OPERATORS, TAGGING_OPS, UNFORKABLE, Mapper
 
 torch = LazyLoader("torch")
+torchvision_transforms = LazyLoader("torchvision.transforms")
 transformers = LazyLoader("transformers")
 sentencepiece = LazyLoader("sentencepiece")
 
 OP_NAME = "image_humanaesexpert_mapper"
-IMAGENET_MEAN = np.asarray((0.485, 0.456, 0.406), dtype=np.float32)
-IMAGENET_STD = np.asarray((0.229, 0.224, 0.225), dtype=np.float32)
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 
 EXPERT_DIMENSIONS: Tuple[Tuple[str, str, str], ...] = (
     ("facial_brightness", "Facial Brightness", "面部亮度"),
@@ -222,6 +222,7 @@ class ImageHumanAesExpertMapper(Mapper):
         self.persistent_actor_pool_size = int(persistent_actor_pool_size)
         self._model = None
         self._tokenizer = None
+        self._image_transform = None
         self._persistent_handles = None
 
     def __getstate__(self):
@@ -328,20 +329,32 @@ class ImageHumanAesExpertMapper(Mapper):
         ImageFile.LOAD_TRUNCATED_IMAGES = True
         with Image.open(path) as source:
             image = source.convert("RGB")
-        tensors = []
-        for tile in _dynamic_preprocess(
-            image,
-            max_num=self.max_num,
-            image_size=self.input_size,
-        ):
-            values = np.asarray(tile, dtype=np.float32) / 255.0
-            values = (values - IMAGENET_MEAN) / IMAGENET_STD
-            tensors.append(
-                torch.from_numpy(
-                    np.ascontiguousarray(values.transpose(2, 0, 1))
-                )
+        if self._image_transform is None:
+            self._image_transform = torchvision_transforms.Compose(
+                [
+                    torchvision_transforms.Resize(
+                        (self.input_size, self.input_size),
+                        interpolation=(
+                            torchvision_transforms.InterpolationMode.BICUBIC
+                        ),
+                    ),
+                    torchvision_transforms.ToTensor(),
+                    torchvision_transforms.Normalize(
+                        mean=IMAGENET_MEAN,
+                        std=IMAGENET_STD,
+                    ),
+                ]
             )
-        return torch.stack(tensors)
+        return torch.stack(
+            [
+                self._image_transform(tile)
+                for tile in _dynamic_preprocess(
+                    image,
+                    max_num=self.max_num,
+                    image_size=self.input_size,
+                )
+            ]
+        )
 
     def _score_image(self, path: str) -> Dict:
         model, tokenizer = self._load_model()

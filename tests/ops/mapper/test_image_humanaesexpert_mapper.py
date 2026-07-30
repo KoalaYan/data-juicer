@@ -5,6 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
 from PIL import Image
 
 import data_juicer.ops.mapper.image_humanaesexpert_mapper as hae_module
@@ -28,6 +29,30 @@ class ImageHumanAesExpertMapperTest(DataJuicerTestCaseBase):
         )
         self.assertLessEqual(len(tiles), 5)
         self.assertTrue(all(tile.size == (64, 64) for tile in tiles))
+
+    def test_load_image_tensor_uses_torchvision_normalization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = os.path.join(directory, "pixel.png")
+            Image.new("RGB", (64, 64), (255, 128, 0)).save(image_path)
+            op = ImageHumanAesExpertMapper(input_size=64, max_num=1)
+
+            tensor = op._load_image_tensor(image_path)
+
+            expected = torch.tensor(
+                [
+                    (1.0 - 0.485) / 0.229,
+                    (128.0 / 255.0 - 0.456) / 0.224,
+                    (0.0 - 0.406) / 0.225,
+                ]
+            )
+            self.assertEqual(tuple(tensor.shape), (1, 3, 64, 64))
+            torch.testing.assert_close(
+                tensor[0, :, 0, 0],
+                expected,
+                rtol=0,
+                atol=1e-6,
+            )
+            self.assertIsNotNone(op._image_transform)
 
     def test_build_score_record_checks_official_mapping(self):
         op = ImageHumanAesExpertMapper()
