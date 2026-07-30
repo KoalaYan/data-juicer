@@ -182,12 +182,57 @@ The stage-specific and non-windowed pipelines support a cross-process cache
 quota. AOSS downloads use `Client.download_file()` to stream into private
 temporary files and atomically publish complete files.
 
-The recommended fused cluster launcher instead uses bounded 500-row execution
-windows. The window size itself is the hard payload-file bound, so this mode
-does not create or update the per-image AFS quota JSON. Ray streams download,
-portrait triage, routing, and HumanAesExpert scoring within each window.
-Published images are deleted by the router or scorer, and at most one window
-plus the bounded in-flight temporary downloads occupies storage.
+## Direct single-node fused pipeline (recommended for 8 H100)
+
+`run_direct_portrait_humanaesexpert.py` avoids the Ray/Data-Juicer executor
+while continuing to call the same Data-Juicer portrait-quality, cache-router,
+S3/AOSS, cache-quota, and HumanAesExpert implementations.
+
+The fixed single-node layout is:
+
+- one long-lived process on GPU 0 for batched person, pose, face, exposure,
+  crop, and sharpness analysis;
+- seven long-lived HumanAesExpert processes on GPUs 1 through 7;
+- a 24-thread AOSS producer by default;
+- bounded download, scoring, and result queues;
+- immediate cache deletion after routing an ineligible image or completing an
+  eligible image's 12-dimensional score.
+
+Downloads, portrait analysis, and HumanAesExpert inference overlap
+continuously. The queue capacities and cross-process `FileCacheQuota` bound
+published cache files. Private `.part` files exist only for the configured
+number of active download threads and are atomically published after a
+complete AOSS download.
+
+The models remain loaded across all 10,000-row micro-shards. Each micro-shard
+still writes an atomic `data.jsonl` and `SUCCESS`; a restart validates and
+skips completed micro-shards. There is no final merge into one huge JSONL.
+The direct output remains 1:1 with input. `portrait_clear` and
+`human_present` rows receive HumanAesExpert scores, while all other rows retain
+their portrait-quality result with a `null` score entry.
+
+For the first 100,000-row cluster test:
+
+```bash
+export AOSS_CONF="/mnt/afs/private/path/to/aoss.conf"
+
+/mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer/demos/portrait_quality_gate/run_direct_first100k_cluster_8h100.sh
+```
+
+The launcher starts in the background. Inspect a snapshot or follow the full
+log with:
+
+```bash
+/mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer/demos/portrait_quality_gate/monitor_direct_first100k_cluster.sh
+
+tail -n 200 -F \
+  /mnt/afs/yanpeishen/project/t2i/purchased-data-governance/results/portrait_quality_gate/human_baixing_0515_direct_first100k_micro10k_20260730/logs/pipeline.log
+```
+
+The older fused Ray launcher remains available for comparison. Its bounded
+execution windows limit storage, but Ray block scheduling may prevent the
+configured AOSS concurrency from becoming real task concurrency on a
+single-node fixed pipeline.
 
 ## Task-level shard checkpoints
 
