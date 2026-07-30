@@ -177,6 +177,10 @@ class ImageHumanAesExpertMapperTest(DataJuicerTestCaseBase):
             persistent_actor_pool=True,
             persistent_actor_pool_size=7,
             skip_ineligible=True,
+            accelerator=None,
+            memory=None,
+            num_gpus=1,
+            ray_execution_mode=None,
         )
         observed = []
 
@@ -220,6 +224,7 @@ class ImageHumanAesExpertMapperTest(DataJuicerTestCaseBase):
         self.assertEqual(op.accelerator, "cpu")
         self.assertEqual(op.ray_execution_mode, "actor")
         self.assertEqual(op.memory, 1.0)
+        self.assertEqual(op.num_gpus, 0)
 
     def test_flash_attention_is_enabled_by_default(self):
         op = ImageHumanAesExpertMapper()

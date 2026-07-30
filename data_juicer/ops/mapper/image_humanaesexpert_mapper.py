@@ -162,11 +162,17 @@ class ImageHumanAesExpertMapper(Mapper):
         **kwargs,
     ):
         if persistent_actor_pool:
-            kwargs.setdefault("memory", "1GB")
-            kwargs.setdefault("accelerator", "cpu")
-            kwargs.setdefault("ray_execution_mode", "actor")
-        else:
-            kwargs.setdefault("memory", "24GB")
+            # This actor only routes paths to the detached GPU scoring pool.
+            # Config expansion may explicitly pass None for these fields, so
+            # setdefault() would incorrectly retain the class-level CUDA
+            # default and make Ray request another GPU per routing actor.
+            kwargs["accelerator"] = "cpu"
+            kwargs["num_gpus"] = 0
+            kwargs["ray_execution_mode"] = "actor"
+            if kwargs.get("memory") is None:
+                kwargs["memory"] = "1GB"
+        elif kwargs.get("memory") is None:
+            kwargs["memory"] = "24GB"
         super().__init__(*args, **kwargs)
         if input_size < 64:
             raise ValueError("input_size must be at least 64")
