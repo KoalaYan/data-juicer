@@ -316,6 +316,20 @@ dependency error does not first appear after seven GPU actors start warming.
 The pinned environment uses `opencv-contrib-python-headless`; compute nodes
 do not need the GUI package's system-level `libGL.so.1`.
 
+HumanAesExpert actors use FlashAttention2 by default for both the InternViT
+vision encoder and InternLM2 attention paths. Pass `--disable-flash-attn` to
+the fused pipeline and pool manager only for numerical comparison or fallback.
+The H100-only source build used for this environment is:
+
+```bash
+PATH=/mnt/afs/yanpeishen/.conda/envs/portrait-hae-datajuicer/bin:$PATH \
+CUDA_HOME=/usr/local/cuda \
+MAX_JOBS=8 \
+FLASH_ATTN_CUDA_ARCHS=90 \
+/mnt/afs/yanpeishen/.conda/envs/portrait-hae-datajuicer/bin/python \
+  -m pip install flash-attn==2.8.3.post1 --no-build-isolation
+```
+
 For the full run, the recommended high-throughput mode is a bounded fused
 pipeline:
 

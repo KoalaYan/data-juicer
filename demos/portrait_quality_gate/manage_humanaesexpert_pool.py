@@ -18,6 +18,7 @@ if str(REPOSITORY) not in sys.path:
 HAE_DEPENDENCIES = {
     "accelerate": "0.33.0",
     "einops": "0.8.2",
+    "flash-attn": "2.8.3.post1",
     "opencv-contrib-python-headless": "4.11.0.86",
     "sentencepiece": "0.2.0",
     "timm": "0.6.7",
@@ -51,6 +52,8 @@ def validate_dependencies(dependencies=None):
             + "\n- ".join(failures)
             + "\nInstall the pinned environment with:\n"
             + f"{sys.executable} -m pip install -r {requirements}"
+            + "\nFlashAttention requires the H100 source-build command "
+            "documented in demos/portrait_quality_gate/README.md."
         )
     return installed
 
@@ -77,6 +80,7 @@ def main() -> None:
     parser.add_argument("--input-size", type=positive_int, default=448)
     parser.add_argument("--max-num", type=positive_int, default=12)
     parser.add_argument("--allow-model-download", action="store_true")
+    parser.add_argument("--disable-flash-attn", action="store_true")
     args = parser.parse_args()
 
     os.environ.setdefault("DATA_JUICER_LAZY_OP_IMPORT", "1")
@@ -108,6 +112,7 @@ def main() -> None:
             "input_size": args.input_size,
             "max_num": args.max_num,
             "local_files_only": not args.allow_model_download,
+            "use_flash_attn": not args.disable_flash_attn,
         }
         result = start_pool(
             ray,

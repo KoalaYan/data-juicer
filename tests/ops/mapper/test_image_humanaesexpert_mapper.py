@@ -221,6 +221,13 @@ class ImageHumanAesExpertMapperTest(DataJuicerTestCaseBase):
         self.assertEqual(op.ray_execution_mode, "actor")
         self.assertEqual(op.memory, 1.0)
 
+    def test_flash_attention_is_enabled_by_default(self):
+        op = ImageHumanAesExpertMapper()
+        self.assertTrue(op.use_flash_attn)
+
+        eager_op = ImageHumanAesExpertMapper(use_flash_attn=False)
+        self.assertFalse(eager_op.use_flash_attn)
+
 
 if __name__ == "__main__":
     unittest.main()

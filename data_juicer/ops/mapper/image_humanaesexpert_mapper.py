@@ -153,6 +153,7 @@ class ImageHumanAesExpertMapper(Mapper):
         allow_unsupported_transformers: bool = False,
         required_sentencepiece_version: str = "0.2.0",
         allow_unsupported_sentencepiece: bool = False,
+        use_flash_attn: bool = True,
         persistent_actor_pool: bool = False,
         persistent_actor_namespace: str = "portrait-quality-gate",
         persistent_actor_prefix: str = "humanaesexpert",
@@ -206,6 +207,7 @@ class ImageHumanAesExpertMapper(Mapper):
         self.allow_unsupported_sentencepiece = bool(
             allow_unsupported_sentencepiece
         )
+        self.use_flash_attn = bool(use_flash_attn)
         if persistent_actor_pool_size < 1:
             raise ValueError("persistent_actor_pool_size must be positive")
         self.persistent_actor_pool = bool(persistent_actor_pool)
@@ -300,7 +302,7 @@ class ImageHumanAesExpertMapper(Mapper):
                 cache_dir=cache_dir,
                 torch_dtype=torch.float16,
                 low_cpu_mem_usage=True,
-                use_flash_attn=False,
+                use_flash_attn=self.use_flash_attn,
                 trust_remote_code=True,
                 local_files_only=self.local_files_only,
             )
@@ -354,6 +356,9 @@ class ImageHumanAesExpertMapper(Mapper):
         )
         record["transformers_version"] = transformers.__version__
         record["sentencepiece_version"] = sentencepiece.__version__
+        record["attention_backend"] = (
+            "flash_attention_2" if self.use_flash_attn else "eager"
+        )
         return record
 
     def _build_score_record(

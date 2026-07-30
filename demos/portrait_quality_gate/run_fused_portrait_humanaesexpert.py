@@ -151,6 +151,11 @@ def main() -> None:
         action="store_true",
         help="Allow Hugging Face network access when weights are not cached.",
     )
+    parser.add_argument(
+        "--disable-flash-attn",
+        action="store_true",
+        help="Use eager attention instead of FlashAttention2.",
+    )
     args = parser.parse_args()
 
     if "AOSS_CONF" not in os.environ:
@@ -258,6 +263,7 @@ def main() -> None:
                     ),
                     "persistent_actor_prefix": args.persistent_actor_prefix,
                     "persistent_actor_pool_size": args.score_workers,
+                    "use_flash_attn": not args.disable_flash_attn,
                 }
             },
         ],

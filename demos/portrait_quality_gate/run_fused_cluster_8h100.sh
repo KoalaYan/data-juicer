@@ -30,7 +30,14 @@ fi
 export DATA_JUICER_LAZY_OP_IMPORT=1
 export PYTHONPATH="${REPOSITORY}${PYTHONPATH:+:${PYTHONPATH}}"
 
-"${PYTHON}" "${POOL_MANAGER}" check
+pool_attention_args=()
+for argument in "$@"; do
+  if [[ "${argument}" == "--disable-flash-attn" ]]; then
+    pool_attention_args+=("--disable-flash-attn")
+  fi
+done
+
+"${PYTHON}" "${POOL_MANAGER}" check "${pool_attention_args[@]}"
 
 ray_owned=0
 cleanup() {
@@ -64,7 +71,8 @@ fi
   --namespace portrait-quality-gate \
   --prefix humanaesexpert \
   --size 7 \
-  --model-cache "${MODEL_CACHE}"
+  --model-cache "${MODEL_CACHE}" \
+  "${pool_attention_args[@]}"
 
 "${PYTHON}" "${SCRIPT}" \
   --mode fused \
