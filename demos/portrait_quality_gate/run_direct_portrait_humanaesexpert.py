@@ -26,10 +26,9 @@ import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Sequence, Tuple
 
 
-REPOSITORY = Path(__file__).resolve().parents[2]
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 DEFAULT_MODEL_CACHE = Path(
     "/mnt/afs/yanpeishen/model_cache/huggingface"
@@ -669,6 +668,8 @@ def valid_micro_success(
         and output_rows == shard["rows"]
         and marker.get("cache", {}).get("files") == 0
         and marker.get("cache", {}).get("bytes") == 0
+        and marker.get("cache", {}).get("references") == 0
+        and marker.get("cache", {}).get("partial_files") == 0
     )
 
 
@@ -1144,6 +1145,8 @@ def main() -> None:
     cache_root.mkdir(parents=True, exist_ok=True)
     attempts_root = output_root / ".attempts"
     attempts_root.mkdir(parents=True, exist_ok=True)
+    failures_root = work_root / "failures"
+    failures_root.mkdir(parents=True, exist_ok=True)
 
     sys.path.insert(0, str(SCRIPT_DIRECTORY))
     from run_sharded_pipeline import (
@@ -1307,6 +1310,10 @@ def main() -> None:
                 )
             )
             attempt_dir.mkdir()
+            failure_path = failures_root / (
+                f"shard-{shard['logical_index']:06d}-"
+                f"micro-{shard['micro_index']:04d}.json"
+            )
             print(
                 f"[micro-start] logical={shard['logical_index']} "
                 f"micro={shard['micro_index']} rows={shard['rows']}",
@@ -1360,6 +1367,7 @@ def main() -> None:
                 }
                 atomic_write_json(attempt_dir / "SUCCESS", marker)
                 os.replace(attempt_dir, final_dir)
+                failure_path.unlink(missing_ok=True)
                 completed += 1
                 atomic_write_json(
                     output_root / "PROGRESS.json",
@@ -1382,10 +1390,45 @@ def main() -> None:
                     f"rate={summary['images_per_second']}_images/s",
                     flush=True,
                 )
-            except BaseException:
+            except BaseException as error:
                 if attempt_dir.exists():
                     safe_rmtree(attempt_dir, attempts_root)
                 cleanup_cache(cache_root)
+                atomic_write_json(
+                    failure_path,
+                    {
+                        "version": 1,
+                        "mode": "direct-fused",
+                        "logical_shard_index": shard["logical_index"],
+                        "micro_shard_index": shard["index"],
+                        "micro_index_within_logical_shard": shard[
+                            "micro_index"
+                        ],
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                        "traceback": traceback.format_exc(),
+                        "failed_at": datetime.now(
+                            timezone.utc
+                        ).isoformat(),
+                    },
+                )
+                atomic_write_json(
+                    output_root / "PROGRESS.json",
+                    {
+                        "status": "failed",
+                        "completed_micro_shards": completed,
+                        "skipped_micro_shards": skipped,
+                        "failed_logical_shard_index": shard[
+                            "logical_index"
+                        ],
+                        "failed_micro_index": shard["micro_index"],
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                        "updated_at": datetime.now(
+                            timezone.utc
+                        ).isoformat(),
+                    },
+                )
                 raise
 
         atomic_write_json(
