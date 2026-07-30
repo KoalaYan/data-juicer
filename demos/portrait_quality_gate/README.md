@@ -313,6 +313,8 @@ Install the complete pinned HumanAesExpert remote-code dependency set with:
 The cluster launcher runs `manage_humanaesexpert_pool.py check` before
 starting Ray. It reports every missing or mismatched package together, so a
 dependency error does not first appear after seven GPU actors start warming.
+The pinned environment uses `opencv-contrib-python-headless`; compute nodes
+do not need the GUI package's system-level `libGL.so.1`.
 
 For the full run, the recommended high-throughput mode is a bounded fused
 pipeline:

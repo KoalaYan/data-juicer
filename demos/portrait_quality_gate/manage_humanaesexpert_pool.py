@@ -18,6 +18,7 @@ if str(REPOSITORY) not in sys.path:
 HAE_DEPENDENCIES = {
     "accelerate": "0.33.0",
     "einops": "0.8.2",
+    "opencv-contrib-python-headless": "4.11.0.86",
     "sentencepiece": "0.2.0",
     "timm": "0.6.7",
     "transformers": "4.44.2",
