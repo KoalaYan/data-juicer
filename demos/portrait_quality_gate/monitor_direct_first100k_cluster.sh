@@ -4,24 +4,39 @@ set -Eeuo pipefail
 readonly RUN_ROOT="/mnt/afs/yanpeishen/project/t2i/purchased-data-governance/results/portrait_quality_gate/human_baixing_0515_direct_first100k_micro10k_20260730"
 readonly CACHE_ROOT="/mnt/afs/yanpeishen/cache/data-juicer/human_baixing_0515_direct_first100k_micro10k_20260730"
 readonly LOG_FILE="${RUN_ROOT}/logs/pipeline.log"
-readonly STATE_FILE="${RUN_ROOT}/logs/pipeline.state"
-readonly PID_FILE="${RUN_ROOT}/logs/pipeline.pid"
+readonly DEV_LOG_FILE="${RUN_ROOT}/logs/pipeline-dev.log"
 readonly PROGRESS_FILE="${RUN_ROOT}/output/PROGRESS.json"
 
-echo "===== state ====="
-if [[ -f "${STATE_FILE}" ]]; then
-  /bin/cat "${STATE_FILE}"
-else
-  echo "missing: ${STATE_FILE}"
-fi
+for role_suffix in "" "-dev"; do
+  if [[ -z "${role_suffix}" ]]; then
+    role="cluster"
+  else
+    role="dev"
+  fi
+  state_file="${RUN_ROOT}/logs/pipeline${role_suffix}.state"
+  pid_file="${RUN_ROOT}/logs/pipeline${role_suffix}.pid"
+  echo "===== ${role} state ====="
+  if [[ -f "${state_file}" ]]; then
+    /bin/cat "${state_file}"
+  else
+    echo "missing: ${state_file}"
+  fi
 
-echo "===== pid ====="
-if [[ -f "${PID_FILE}" ]]; then
-  pipeline_pid="$(<"${PID_FILE}")"
-  echo "${pipeline_pid}"
-  /bin/ps -o pid=,ppid=,stat=,etime=,cmd= -p "${pipeline_pid}" || true
+  echo "===== ${role} pid ====="
+  if [[ -f "${pid_file}" ]]; then
+    pipeline_pid="$(<"${pid_file}")"
+    echo "${pipeline_pid}"
+    /bin/ps -o pid=,ppid=,stat=,etime=,cmd= -p "${pipeline_pid}" || true
+  else
+    echo "no active pid file"
+  fi
+done
+
+echo "===== shared checkpoint lock ====="
+if [[ -f "${RUN_ROOT}/DIRECT_PIPELINE_LOCK/owner" ]]; then
+  /bin/cat "${RUN_ROOT}/DIRECT_PIPELINE_LOCK/owner"
 else
-  echo "no active pid file"
+  echo "unlocked"
 fi
 
 echo "===== progress ====="
@@ -42,12 +57,17 @@ echo "files=${cache_files}"
 /usr/bin/du -sh "${CACHE_ROOT}" 2>/dev/null || true
 
 echo "===== recent throughput ====="
-if [[ -f "${LOG_FILE}" ]]; then
-  /usr/bin/tail -c 200000 "${LOG_FILE}" \
-    | /usr/bin/tr -d '\000' \
-    | /usr/bin/grep -E \
-      '\[progress\]|\[micro-(start|done)\]|\[worker-ready\]|\[done\]|Traceback|FAILED' \
-    | /usr/bin/tail -n 50
-else
-  echo "missing: ${LOG_FILE}"
-fi
+for log_file in "${LOG_FILE}" "${DEV_LOG_FILE}"; do
+  echo "--- ${log_file} ---"
+  if [[ -f "${log_file}" ]]; then
+    {
+      /usr/bin/tail -c 200000 "${log_file}" \
+        | /usr/bin/tr -d '\000' \
+        | /usr/bin/grep -E \
+          '\[progress\]|\[micro-(start|done)\]|\[worker-ready\]|\[done\]|\[lock\]|Traceback|FAILED' \
+        | /usr/bin/tail -n 50
+    } || true
+  else
+    echo "missing"
+  fi
+done

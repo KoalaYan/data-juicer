@@ -4,6 +4,7 @@ set -Eeuo pipefail
 readonly REPOSITORY="/mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer"
 readonly PYTHON="/mnt/afs/yanpeishen/.conda/envs/portrait-hae-datajuicer/bin/python"
 readonly PIPELINE="${REPOSITORY}/demos/portrait_quality_gate/run_direct_portrait_humanaesexpert.py"
+readonly LOCK_HELPER="${REPOSITORY}/demos/portrait_quality_gate/direct_pipeline_lock.sh"
 readonly INPUT="/mnt/afs/yanpeishen/project/t2i/purchased-data-governance/results/humanaesexpert_8b/human_baixing_0515_first100000_20260728/selection/first_100000_ordered.jsonl"
 readonly RUN_ROOT="/mnt/afs/yanpeishen/project/t2i/purchased-data-governance/results/portrait_quality_gate/human_baixing_0515_direct_first100k_micro10k_20260730"
 readonly OUTPUT_ROOT="${RUN_ROOT}/output"
@@ -11,9 +12,18 @@ readonly WORK_ROOT="${RUN_ROOT}/work"
 readonly LOG_ROOT="${RUN_ROOT}/logs"
 readonly CACHE_ROOT="/mnt/afs/yanpeishen/cache/data-juicer/human_baixing_0515_direct_first100k_micro10k_20260730"
 readonly MODEL_CACHE="/mnt/afs/yanpeishen/model_cache/huggingface"
-readonly LOG_FILE="${LOG_ROOT}/pipeline.log"
-readonly STATE_FILE="${LOG_ROOT}/pipeline.state"
-readonly PID_FILE="${LOG_ROOT}/pipeline.pid"
+readonly LAUNCHER_ROLE="${DIRECT_LAUNCHER_ROLE:-cluster}"
+if [[ "${LAUNCHER_ROLE}" == "dev" ]]; then
+  readonly LOG_SUFFIX="-dev"
+elif [[ "${LAUNCHER_ROLE}" == "cluster" ]]; then
+  readonly LOG_SUFFIX=""
+else
+  echo "DIRECT_LAUNCHER_ROLE must be cluster or dev." >&2
+  exit 1
+fi
+readonly LOG_FILE="${LOG_ROOT}/pipeline${LOG_SUFFIX}.log"
+readonly STATE_FILE="${LOG_ROOT}/pipeline${LOG_SUFFIX}.state"
+readonly PID_FILE="${LOG_ROOT}/pipeline${LOG_SUFFIX}.pid"
 readonly SCRIPT_NAME="${0##*/}"
 
 pipeline_pid_is_active() {
@@ -40,12 +50,13 @@ if [[ -z "${AOSS_CONF:-}" || "${AOSS_CONF}" != /* || ! -f "${AOSS_CONF}" ]]; the
   echo "AOSS_CONF must be an absolute path to an existing private config file." >&2
   exit 1
 fi
-for required in "${PYTHON}" "${PIPELINE}" "${INPUT}"; do
+for required in "${PYTHON}" "${PIPELINE}" "${LOCK_HELPER}" "${INPUT}"; do
   if [[ ! -e "${required}" ]]; then
     echo "Required path does not exist: ${required}" >&2
     exit 1
   fi
 done
+source "${LOCK_HELPER}"
 
 /bin/mkdir -p "${LOG_ROOT}"
 
@@ -95,6 +106,9 @@ on_signal() {
 trap on_error ERR
 trap 'on_signal TERM 143' TERM
 trap 'on_signal INT 130' INT
+trap release_direct_pipeline_lock EXIT
+
+acquire_direct_pipeline_lock "${RUN_ROOT}" "${SCRIPT_NAME}"
 
 echo "$$" > "${PID_FILE}"
 echo "RUNNING time=$(/bin/date --iso-8601=seconds) pid=$$" \
@@ -106,6 +120,7 @@ export TOKENIZERS_PARALLELISM=false
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
 echo "[run] executor=direct-no-ray"
+echo "[run] launcher_role=${LAUNCHER_ROLE}"
 echo "[run] python=${PYTHON}"
 echo "[run] input=${INPUT}"
 echo "[run] output_root=${OUTPUT_ROOT}"
@@ -113,6 +128,8 @@ echo "[run] work_root=${WORK_ROOT}"
 echo "[run] cache_root=${CACHE_ROOT}"
 echo "[run] logical_shard=100000 micro_shard=10000 index=0"
 echo "[run] download_workers=${DIRECT_DOWNLOAD_WORKERS:-24}"
+echo "[run] score_workers=${DIRECT_SCORE_WORKERS:-7}"
+echo "[run] visible_gpu_tokens=${CUDA_VISIBLE_DEVICES}"
 
 "${PYTHON}" "${PIPELINE}" \
   --input "${INPUT}" \
@@ -131,7 +148,7 @@ echo "[run] download_workers=${DIRECT_DOWNLOAD_WORKERS:-24}"
   --result-queue-size "${DIRECT_RESULT_QUEUE_SIZE:-512}" \
   --quality-batch-size "${DIRECT_QUALITY_BATCH_SIZE:-64}" \
   --quality-batch-wait "${DIRECT_QUALITY_BATCH_WAIT:-0.05}" \
-  --score-workers 7 \
+  --score-workers "${DIRECT_SCORE_WORKERS:-7}" \
   --max-cache-files "${DIRECT_MAX_CACHE_FILES:-512}" \
   --max-cache-bytes "${DIRECT_MAX_CACHE_BYTES:-53687091200}" \
   --aoss-download-attempts 5 \

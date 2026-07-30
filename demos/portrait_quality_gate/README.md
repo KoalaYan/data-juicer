@@ -219,6 +219,27 @@ export AOSS_CONF="/mnt/afs/private/path/to/aoss.conf"
 /mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer/demos/portrait_quality_gate/run_direct_first100k_cluster_8h100.sh
 ```
 
+The same run can be continued on the one-H100 development host:
+
+```bash
+export AOSS_CONF="/mnt/afs/private/path/to/aoss.conf"
+
+/mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer/demos/portrait_quality_gate/run_direct_first100k_dev_1h100.sh
+```
+
+The development launcher gives the quality process and one HumanAesExpert
+process the same physical GPU. It intentionally uses the exact same input
+manifest, output, work, and cache roots as the 8-H100 launcher. Consequently,
+either host validates and skips every 10,000-row micro-shard completed by the
+other host before loading models.
+
+The two launchers must not run simultaneously. Both acquire the atomic
+`DIRECT_PIPELINE_LOCK` directory under the shared AFS run root. The owner file
+records hostname, PID, launcher, and start time. Normal success, failure,
+SIGINT, and SIGTERM release the lock. If a host is killed without cleanup,
+inspect the owner metadata and confirm that job has stopped before manually
+removing the stale lock directory.
+
 The launcher starts in the background. Inspect a snapshot or follow the full
 log with:
 
@@ -228,6 +249,10 @@ log with:
 tail -n 200 -F \
   /mnt/afs/yanpeishen/project/t2i/purchased-data-governance/results/portrait_quality_gate/human_baixing_0515_direct_first100k_micro10k_20260730/logs/pipeline.log
 ```
+
+Development-host logs use `pipeline-dev.log`; the monitor command displays
+both launchers, the shared lock owner, cache usage, and the common
+`PROGRESS.json`.
 
 The older fused Ray launcher remains available for comparison. Its bounded
 execution windows limit storage, but Ray block scheduling may prevent the
