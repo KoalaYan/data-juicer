@@ -52,6 +52,10 @@ echo "[run] logical_shard=100000 micro_shard=10000 index=0"
   --logical-shard-index 0 \
   --download-workers 8 \
   --download-concurrency 1 \
+  --aoss-download-attempts 5 \
+  --aoss-retry-initial-delay 1.5 \
+  --aoss-retry-max-delay 12 \
+  --aoss-retry-jitter 1 \
   --max-cache-files 2048 \
   --max-cache-bytes 214748364800 \
   "$@" 2>&1 | /usr/bin/tee -a "${LOG_FILE}"

@@ -264,10 +264,15 @@ export AOSS_CONF="/mnt/afs/private/path/to/aoss.conf"
 ```
 
 The smoke launcher uses eight download workers with one in-flight request per
-single-sample batch. The installed AOSS client already performs up to ten
-internal attempts. A final download failure is raised immediately in the
-download operator so the current micro-shard fails with its S3 URI instead of
-failing later during image decoding.
+single-sample batch. The installed AOSS client performs up to ten internal
+attempts without any delay. The download operator therefore adds five outer
+attempts for retryable system and connection failures, with exponential
+backoff starting at 1.5 seconds, capped at 12 seconds, plus up to one second
+of random jitter. Missing objects are not retried. A final download failure
+is raised in the download operator so the current micro-shard fails with its
+S3 URI instead of failing later during image decoding. These values can be
+changed with `--aoss-download-attempts`, `--aoss-retry-initial-delay`,
+`--aoss-retry-max-delay`, and `--aoss-retry-jitter`.
 
 Monitor structured progress:
 

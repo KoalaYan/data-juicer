@@ -46,6 +46,13 @@ def positive_int(value: str) -> int:
     return result
 
 
+def non_negative_float(value: str) -> float:
+    result = float(value)
+    if result < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return result
+
+
 def gpu_fraction(value: str) -> float:
     result = float(value)
     if not 0 < result <= 1:
@@ -96,6 +103,22 @@ def main() -> None:
     )
     parser.add_argument("--download-workers", type=positive_int, default=8)
     parser.add_argument("--download-concurrency", type=positive_int, default=1)
+    parser.add_argument("--aoss-download-attempts", type=positive_int, default=5)
+    parser.add_argument(
+        "--aoss-retry-initial-delay",
+        type=non_negative_float,
+        default=1.5,
+    )
+    parser.add_argument(
+        "--aoss-retry-max-delay",
+        type=non_negative_float,
+        default=12.0,
+    )
+    parser.add_argument(
+        "--aoss-retry-jitter",
+        type=non_negative_float,
+        default=1.0,
+    )
     parser.add_argument("--quality-workers", type=positive_int, default=4)
     parser.add_argument(
         "--quality-gpus-per-worker",
@@ -209,6 +232,12 @@ def main() -> None:
                     "max_cache_files": args.max_cache_files,
                     "max_cache_bytes": args.max_cache_bytes,
                     "fail_on_download_error": True,
+                    "aoss_max_attempts": args.aoss_download_attempts,
+                    "aoss_retry_initial_delay": (
+                        args.aoss_retry_initial_delay
+                    ),
+                    "aoss_retry_max_delay": args.aoss_retry_max_delay,
+                    "aoss_retry_jitter": args.aoss_retry_jitter,
                 }
             },
             {

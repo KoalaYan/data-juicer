@@ -1,9 +1,12 @@
 import asyncio
 import copy
+import errno
 import hashlib
 import os
 import os.path as osp
+import random
 import threading
+import time
 from typing import List, Union
 
 from loguru import logger
@@ -58,6 +61,10 @@ class S3DownloadFileMapper(Mapper):
         cache_quota_wait_timeout: float = 1800.0,
         cache_quota_poll_interval: float = 1.0,
         fail_on_download_error: bool = False,
+        aoss_max_attempts: int = 5,
+        aoss_retry_initial_delay: float = 1.5,
+        aoss_retry_max_delay: float = 12.0,
+        aoss_retry_jitter: float = 1.0,
         *args,
         **kwargs,
     ):
@@ -96,6 +103,14 @@ class S3DownloadFileMapper(Mapper):
         :param fail_on_download_error: Raise immediately after a download
             batch contains failed objects instead of passing their remote URI
             to downstream operators.
+        :param aoss_max_attempts: Maximum outer attempts for one AOSS object.
+            The outer retry adds delays because the internal AOSS retries do
+            not wait between attempts.
+        :param aoss_retry_initial_delay: Initial exponential-backoff delay in
+            seconds after a retryable AOSS failure.
+        :param aoss_retry_max_delay: Maximum base backoff delay in seconds.
+        :param aoss_retry_jitter: Maximum random delay added to each backoff
+            to prevent synchronized retries across workers.
         :param args: extra args
         :param kwargs: extra args
         """
@@ -144,6 +159,23 @@ class S3DownloadFileMapper(Mapper):
         self.cache_quota_wait_timeout = float(cache_quota_wait_timeout)
         self.cache_quota_poll_interval = float(cache_quota_poll_interval)
         self.fail_on_download_error = fail_on_download_error
+        if aoss_max_attempts < 1:
+            raise ValueError("aoss_max_attempts must be positive")
+        if aoss_retry_initial_delay < 0:
+            raise ValueError("aoss_retry_initial_delay must be non-negative")
+        if aoss_retry_max_delay < aoss_retry_initial_delay:
+            raise ValueError(
+                "aoss_retry_max_delay must be greater than or equal to "
+                "aoss_retry_initial_delay"
+            )
+        if aoss_retry_jitter < 0:
+            raise ValueError("aoss_retry_jitter must be non-negative")
+        self.aoss_max_attempts = int(aoss_max_attempts)
+        self.aoss_retry_initial_delay = float(
+            aoss_retry_initial_delay
+        )
+        self.aoss_retry_max_delay = float(aoss_retry_max_delay)
+        self.aoss_retry_jitter = float(aoss_retry_jitter)
         self._cache_quota = self._create_cache_quota()
 
         # Prepare config dict for get_aws_credentials
@@ -284,17 +316,73 @@ class S3DownloadFileMapper(Mapper):
             f"{threading.get_ident()}"
         )
 
+    @staticmethod
+    def _is_retryable_aoss_error(error: Exception) -> bool:
+        retryable_errno = {
+            errno.EAGAIN,
+            errno.ECONNRESET,
+            errno.ETIMEDOUT,
+            errno.ECONNREFUSED,
+            errno.EHOSTUNREACH,
+            errno.ENETUNREACH,
+            errno.EPIPE,
+        }
+        current = error
+        visited = set()
+        while current is not None and id(current) not in visited:
+            visited.add(id(current))
+            if isinstance(current, (TimeoutError, ConnectionError)):
+                return True
+            if (
+                isinstance(current, OSError)
+                and current.errno in retryable_errno
+            ):
+                return True
+            current = current.__cause__ or current.__context__
+        return False
+
+    def _read_from_aoss_with_retries(self, s3_url: str) -> bytes:
+        for attempt in range(1, self.aoss_max_attempts + 1):
+            try:
+                content = self.aoss_client.get(s3_url)
+                if hasattr(content, "read"):
+                    content = content.read()
+                if content is None:
+                    raise FileNotFoundError(
+                        f"AOSS returned no data for {s3_url}"
+                    )
+                if not isinstance(content, bytes):
+                    content = bytes(content)
+                return content
+            except Exception as error:
+                retryable = self._is_retryable_aoss_error(error)
+                if not retryable or attempt == self.aoss_max_attempts:
+                    raise
+                base_delay = min(
+                    self.aoss_retry_max_delay,
+                    self.aoss_retry_initial_delay * (2 ** (attempt - 1)),
+                )
+                delay = base_delay + random.uniform(
+                    0.0,
+                    self.aoss_retry_jitter,
+                )
+                logger.warning(
+                    "Retryable AOSS read failure for {} "
+                    "(attempt {}/{}): {}. Retrying in {:.2f}s",
+                    s3_url,
+                    attempt,
+                    self.aoss_max_attempts,
+                    error,
+                    delay,
+                )
+                time.sleep(delay)
+        raise AssertionError("unreachable AOSS retry state")
+
     def _download_from_aoss(self, s3_url: str, save_path: str = None, return_content: bool = False):
         reservation_owned = False
         temporary_path = None
         try:
-            content = self.aoss_client.get(s3_url)
-            if hasattr(content, "read"):
-                content = content.read()
-            if content is None:
-                raise FileNotFoundError(f"AOSS returned no data for {s3_url}")
-            if not isinstance(content, bytes):
-                content = bytes(content)
+            content = self._read_from_aoss_with_retries(s3_url)
 
             if save_path:
                 if self._cache_quota is not None:

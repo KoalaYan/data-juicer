@@ -18,6 +18,26 @@ class _FailingAOSSClient:
         raise TimeoutError(f"timed out: {url}")
 
 
+class _FlakyAOSSClient:
+    def __init__(self):
+        self.attempts = 0
+
+    def get(self, url):
+        self.attempts += 1
+        if self.attempts < 3:
+            raise BlockingIOError(11, "Resource temporarily unavailable")
+        return f"content:{url}".encode()
+
+
+class _MissingAOSSClient:
+    def __init__(self):
+        self.attempts = 0
+
+    def get(self, url):
+        self.attempts += 1
+        return None
+
+
 class S3DownloadFileMapperTest(DataJuicerTestCaseBase):
 
     @patch.dict(os.environ, {"AOSS_CONF": "/private/runtime/aoss.conf"})
@@ -127,6 +147,7 @@ class S3DownloadFileMapperTest(DataJuicerTestCaseBase):
                 preserve_s3_paths=True,
                 s3_backend="aoss",
                 fail_on_download_error=True,
+                aoss_max_attempts=1,
             )
             op._create_aoss_client = lambda: _FailingAOSSClient()
             with self.assertRaisesRegex(
@@ -136,6 +157,64 @@ class S3DownloadFileMapperTest(DataJuicerTestCaseBase):
                 op.process_batched(
                     {"images": [["s3://infographics/timeout.jpg"]]}
                 )
+
+    @patch.dict(os.environ, {"AOSS_CONF": "/private/runtime/aoss.conf"})
+    @patch(
+        "data_juicer.ops.mapper.s3_download_file_mapper.random.uniform",
+        return_value=0.25,
+    )
+    @patch("data_juicer.ops.mapper.s3_download_file_mapper.time.sleep")
+    def test_aoss_retryable_error_uses_backoff_and_recovers(
+        self,
+        sleep,
+        _uniform,
+    ):
+        op = S3DownloadFileMapper(
+            download_field="images",
+            save_field="image_bytes",
+            s3_backend="aoss",
+            aoss_max_attempts=3,
+            aoss_retry_initial_delay=1.5,
+            aoss_retry_max_delay=12.0,
+            aoss_retry_jitter=1.0,
+        )
+        client = _FlakyAOSSClient()
+        op._thread_local.aoss_client = client
+        status, error, content, _ = op._download_from_s3(
+            "s3://infographics/transient.jpg",
+            return_content=True,
+        )
+        self.assertEqual(status, "success")
+        self.assertIsNone(error)
+        self.assertEqual(
+            content,
+            b"content:s3://infographics/transient.jpg",
+        )
+        self.assertEqual(client.attempts, 3)
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list],
+            [1.75, 3.25],
+        )
+
+    @patch.dict(os.environ, {"AOSS_CONF": "/private/runtime/aoss.conf"})
+    @patch("data_juicer.ops.mapper.s3_download_file_mapper.time.sleep")
+    def test_aoss_missing_object_is_not_retried(self, sleep):
+        op = S3DownloadFileMapper(
+            download_field="images",
+            save_field="image_bytes",
+            s3_backend="aoss",
+            aoss_max_attempts=5,
+        )
+        client = _MissingAOSSClient()
+        op._thread_local.aoss_client = client
+        status, error, _, _ = op._download_from_s3(
+            "s3://infographics/missing.jpg",
+            return_content=True,
+        )
+        self.assertEqual(status, "failed")
+        self.assertIn("AOSS returned no data", error)
+        self.assertEqual(client.attempts, 1)
+        sleep.assert_not_called()
 
     @patch.dict(os.environ, {}, clear=True)
     def test_aoss_backend_requires_environment_variable(self):
