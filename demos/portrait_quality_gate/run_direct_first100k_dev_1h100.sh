@@ -9,19 +9,29 @@ if [[ ! -x "${CLUSTER_LAUNCHER}" ]]; then
   exit 1
 fi
 
-# The development host has one H100. Keep it exclusive to HumanAesExpert and
-# run the lightweight portrait-quality models on the host CPUs.
+# The development host has one H100. GPU quality remains the default because
+# the CPU path is substantially slower on this host. Set
+# DIRECT_QUALITY_DEVICE=cpu explicitly for further CPU experiments.
 visible_devices="${CUDA_VISIBLE_DEVICES:-0}"
 dev_gpu_token="${DIRECT_DEV_GPU_TOKEN:-${visible_devices%%,*}}"
+quality_device="${DIRECT_QUALITY_DEVICE:-cuda}"
 if [[ -z "${dev_gpu_token}" ]]; then
   echo "Unable to resolve the development GPU token." >&2
   exit 1
 fi
+if [[ "${quality_device}" != "cpu" && "${quality_device}" != "cuda" ]]; then
+  echo "DIRECT_QUALITY_DEVICE must be cpu or cuda." >&2
+  exit 1
+fi
 
-export CUDA_VISIBLE_DEVICES="${dev_gpu_token}"
+if [[ "${quality_device}" == "cuda" ]]; then
+  export CUDA_VISIBLE_DEVICES="${dev_gpu_token},${dev_gpu_token}"
+else
+  export CUDA_VISIBLE_DEVICES="${dev_gpu_token}"
+fi
 export DIRECT_LAUNCHER_ROLE=dev
 export DIRECT_SCORE_WORKERS=1
-export DIRECT_QUALITY_DEVICE=cpu
+export DIRECT_QUALITY_DEVICE="${quality_device}"
 export DIRECT_QUALITY_CPU_THREADS="${DIRECT_QUALITY_CPU_THREADS:-14}"
 export DIRECT_DOWNLOAD_WORKERS="${DIRECT_DOWNLOAD_WORKERS:-16}"
 export DIRECT_DOWNLOAD_PREFETCH="${DIRECT_DOWNLOAD_PREFETCH:-64}"

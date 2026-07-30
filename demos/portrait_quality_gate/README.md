@@ -227,12 +227,13 @@ export AOSS_CONF="/mnt/afs/private/path/to/aoss.conf"
 /mnt/afs/yanpeishen/project/t2i/data-pipeline/data-juicer/demos/portrait_quality_gate/run_direct_first100k_dev_1h100.sh
 ```
 
-The development launcher runs the quality process on CPU with 14 Torch/OMP
-threads by default and reserves its single H100 for HumanAesExpert. Override
-the CPU budget with `DIRECT_QUALITY_CPU_THREADS`. It intentionally uses the
-exact same input manifest, output, work, and cache roots as the 8-H100
-launcher. Consequently, either host validates and skips every 10,000-row
-micro-shard completed by the other host before loading models.
+The development launcher uses its single H100 for both the quality process
+and one HumanAesExpert process by default. CPU quality remains available for
+experiments with `DIRECT_QUALITY_DEVICE=cpu`; its CPU budget is controlled by
+`DIRECT_QUALITY_CPU_THREADS`. It intentionally uses the exact same input
+manifest, output, work, and cache roots as the 8-H100 launcher. Consequently,
+either host validates and skips every 10,000-row micro-shard completed by the
+other host before loading models.
 
 The two launchers must not run simultaneously. Both acquire the atomic
 `DIRECT_PIPELINE_LOCK` directory under the shared AFS run root. The owner file
