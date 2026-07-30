@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,7 @@ DEFAULT_YOLO_MODEL = Path(
 DEFAULT_YOLO_POSE_MODEL = Path(
     "/mnt/afs/yanpeishen/.cache/data_juicer/models/yolo11n-pose.pt"
 )
+PARTIAL_CACHE_PATTERN = re.compile(r"\.part\.\d+\.\d+$")
 
 
 def absolute_path(value: str) -> Path:
@@ -67,6 +69,16 @@ def safe_cache_root(path: Path) -> Path:
     return resolved
 
 
+def remove_stale_partial_downloads(cache_root: Path) -> None:
+    for path in cache_root.rglob("*"):
+        if (
+            path.is_file()
+            and not path.is_symlink()
+            and PARTIAL_CACHE_PATTERN.search(path.name)
+        ):
+            path.unlink()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -100,6 +112,14 @@ def main() -> None:
         type=positive_int,
         default=200 * 1024**3,
         help="Hard cache byte cap; default: 200 GiB.",
+    )
+    parser.add_argument(
+        "--disable-cache-quota",
+        action="store_true",
+        help=(
+            "Disable per-file shared quota accounting. Intended only for "
+            "bounded execution windows managed by run_sharded_pipeline.py."
+        ),
     )
     parser.add_argument("--download-workers", type=positive_int, default=8)
     parser.add_argument(
@@ -211,11 +231,14 @@ def main() -> None:
     cache_root.mkdir(parents=True, exist_ok=True)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     model_cache.mkdir(parents=True, exist_ok=True)
-    FileCacheQuota(
-        str(cache_root),
-        max_files=args.max_cache_files,
-        max_bytes=args.max_cache_bytes,
-    ).prepare_for_new_run()
+    if args.disable_cache_quota:
+        remove_stale_partial_downloads(cache_root)
+    else:
+        FileCacheQuota(
+            str(cache_root),
+            max_files=args.max_cache_files,
+            max_bytes=args.max_cache_bytes,
+        ).prepare_for_new_run()
 
     config = {
         "project_name": "portrait-humanaesexpert-fused",
@@ -244,8 +267,16 @@ def main() -> None:
                     "num_proc": args.download_workers,
                     "batch_size": args.download_batch_size,
                     "max_concurrent": args.download_concurrency,
-                    "max_cache_files": args.max_cache_files,
-                    "max_cache_bytes": args.max_cache_bytes,
+                    "max_cache_files": (
+                        0
+                        if args.disable_cache_quota
+                        else args.max_cache_files
+                    ),
+                    "max_cache_bytes": (
+                        0
+                        if args.disable_cache_quota
+                        else args.max_cache_bytes
+                    ),
                     "fail_on_download_error": True,
                     "aoss_max_attempts": args.aoss_download_attempts,
                     "aoss_retry_initial_delay": (

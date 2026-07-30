@@ -178,16 +178,16 @@ aesthetics, and comprehensive aesthetics. The aggregate `score` is the
 as model diagnostics and must not be used directly as automatic deletion
 criteria.
 
-Both pipelines use a cross-process cache quota. AOSS downloads use
-`Client.download_file()` to stream into private temporary files, matching the
-previous 24-thread quality-labeling workflow, then acquire quota and
-atomically publish complete files. After scoring, the consumer deletes the
-local file and returns the reservation. When either limit is reached, new
-downloads wait while the GPU continues consuming completed items. The number
-of temporary downloads is bounded by
-`download_workers * download_concurrency`; completed, published files remain
-bounded by both cache limits. Duplicate S3 paths are reference-counted and
-are deleted after their final in-flight consumer.
+The stage-specific and non-windowed pipelines support a cross-process cache
+quota. AOSS downloads use `Client.download_file()` to stream into private
+temporary files and atomically publish complete files.
+
+The recommended fused cluster launcher instead uses bounded 500-row execution
+windows. The window size itself is the hard payload-file bound, so this mode
+does not create or update the per-image AFS quota JSON. Ray streams download,
+portrait triage, routing, and HumanAesExpert scoring within each window.
+Published images are deleted by the router or scorer, and at most one window
+plus the bounded in-flight temporary downloads occupies storage.
 
 ## Task-level shard checkpoints
 
@@ -288,6 +288,25 @@ later during image decoding. Concurrency can be tuned with
 `--aoss-download-attempts`, `--aoss-retry-initial-delay`,
 `--aoss-retry-max-delay`, and `--aoss-retry-jitter`.
 
+Each 10,000-row micro-shard is internally divided into 500-row execution
+windows. Every window has an input hash, normalized output, output hash, cache
+zero check, and atomic `WINDOW_SUCCESS` under:
+
+```text
+<work-root>/window_checkpoints/
+  shard-000000/micro-0000/
+    window-0000/
+      input.jsonl
+      data.jsonl
+      WINDOW_SUCCESS
+```
+
+If a later window fails, a restart validates and skips earlier successful
+windows. After all 20 windows finish, their outputs are merged and validated
+against the 10,000-row micro-shard before its normal `SUCCESS` is published.
+The temporary window checkpoints are then removed. The seven detached
+HumanAesExpert actors remain loaded across all window subprocesses.
+
 Monitor structured progress:
 
 ```bash
@@ -367,6 +386,7 @@ pipeline:
   --work-root /mnt/afs/yanpeishen/work/portrait-fused \
   --logical-shard-size 100000 \
   --micro-shard-size 10000 \
+  --execution-window-size 500 \
   --download-workers 8 \
   --download-batch-size 8 \
   --download-concurrency 4 \

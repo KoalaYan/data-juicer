@@ -451,6 +451,210 @@ def normalize_output(
     return output_rows, hasher.hexdigest()
 
 
+def jsonl_summary(path: Path) -> Tuple[int, str]:
+    rows = 0
+    hasher = hashlib.sha256()
+    with path.open("rb") as source:
+        for line in source:
+            normalized = line.strip()
+            if not normalized:
+                continue
+            json.loads(normalized)
+            normalized += b"\n"
+            hasher.update(normalized)
+            rows += 1
+    return rows, hasher.hexdigest()
+
+
+def build_execution_windows(
+    input_shard: Path,
+    input_rows: int,
+    input_sha256: str,
+    window_size: int,
+    window_root: Path,
+    checkpoint_parent: Path,
+) -> List[Dict[str, Any]]:
+    manifest_path = window_root / "WINDOW_MANIFEST"
+    if manifest_path.is_file():
+        try:
+            manifest = load_json(manifest_path)
+            windows = manifest.get("windows") or []
+            if (
+                manifest.get("version") == 1
+                and manifest.get("input_sha256") == input_sha256
+                and manifest.get("input_rows") == input_rows
+                and manifest.get("window_size") == window_size
+                and all(
+                    Path(window["input_path"]).is_file()
+                    and Path(window["input_path"]).stat().st_size
+                    == window["input_bytes"]
+                    and jsonl_summary(Path(window["input_path"]))
+                    == (
+                        window["input_rows"],
+                        window["input_sha256"],
+                    )
+                    for window in windows
+                )
+            ):
+                return windows
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            pass
+    if window_root.exists():
+        safe_rmtree(window_root, checkpoint_parent)
+    window_root.mkdir(parents=True)
+
+    windows: List[Dict[str, Any]] = []
+    source_rows = 0
+    target = None
+    target_path = None
+    target_hasher = None
+    target_rows = 0
+    target_bytes = 0
+
+    def finish_window() -> None:
+        nonlocal target, target_path, target_hasher
+        nonlocal target_rows, target_bytes
+        if target is None or target_path is None or target_hasher is None:
+            return
+        target.flush()
+        os.fsync(target.fileno())
+        target.close()
+        window_index = len(windows)
+        final_path = (
+            window_root
+            / f"window-{window_index:04d}"
+            / "input.jsonl"
+        )
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(target_path, final_path)
+        windows.append(
+            {
+                "index": window_index,
+                "input_path": str(final_path),
+                "input_rows": target_rows,
+                "input_bytes": target_bytes,
+                "input_sha256": target_hasher.hexdigest(),
+            }
+        )
+        target = None
+        target_path = None
+        target_hasher = None
+        target_rows = 0
+        target_bytes = 0
+
+    try:
+        with input_shard.open("rb") as source:
+            for line in source:
+                if not line.strip():
+                    continue
+                if target is None:
+                    index = len(windows)
+                    target_path = (
+                        window_root
+                        / f".window-{index:04d}.tmp.{os.getpid()}"
+                    )
+                    target = target_path.open("wb")
+                    target_hasher = hashlib.sha256()
+                normalized = line.strip() + b"\n"
+                target.write(normalized)
+                target_hasher.update(normalized)
+                target_rows += 1
+                target_bytes += len(normalized)
+                source_rows += 1
+                if target_rows >= window_size:
+                    finish_window()
+        finish_window()
+    except BaseException:
+        if target is not None:
+            target.close()
+        if target_path is not None:
+            target_path.unlink(missing_ok=True)
+        raise
+    if source_rows != input_rows:
+        raise RuntimeError(
+            f"execution-window input row mismatch: expected={input_rows}, "
+            f"observed={source_rows}, path={input_shard}"
+        )
+    atomic_write_json(
+        manifest_path,
+        {
+            "version": 1,
+            "input_path": str(input_shard),
+            "input_rows": input_rows,
+            "input_sha256": input_sha256,
+            "window_size": window_size,
+            "windows": windows,
+        },
+    )
+    return windows
+
+
+def valid_window_success(
+    window_dir: Path,
+    mode: str,
+    window: Dict[str, Any],
+) -> bool:
+    marker_path = window_dir / "WINDOW_SUCCESS"
+    data_path = window_dir / "data.jsonl"
+    if not marker_path.is_file() or not data_path.is_file():
+        return False
+    try:
+        marker = load_json(marker_path)
+        output_summary = jsonl_summary(data_path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return (
+        marker.get("version") == 1
+        and marker.get("mode") == mode
+        and marker.get("window_index") == window["index"]
+        and marker.get("input_rows") == window["input_rows"]
+        and marker.get("input_sha256") == window["input_sha256"]
+        and marker.get("output_rows") == window["input_rows"]
+        and output_summary
+        == (
+            marker.get("output_rows"),
+            marker.get("output_sha256"),
+        )
+    )
+
+
+def merge_window_outputs(
+    windows: Sequence[Dict[str, Any]],
+    window_root: Path,
+    normalized_output: Path,
+) -> Tuple[int, str]:
+    temporary = normalized_output.with_name(
+        f".{normalized_output.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    )
+    output_rows = 0
+    hasher = hashlib.sha256()
+    try:
+        with temporary.open("wb") as target:
+            for window in windows:
+                source_path = (
+                    window_root
+                    / f"window-{window['index']:04d}"
+                    / "data.jsonl"
+                )
+                with source_path.open("rb") as source:
+                    for line in source:
+                        normalized = line.strip()
+                        if not normalized:
+                            continue
+                        json.loads(normalized)
+                        normalized += b"\n"
+                        target.write(normalized)
+                        hasher.update(normalized)
+                        output_rows += 1
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, normalized_output)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return output_rows, hasher.hexdigest()
+
+
 def cache_usage(cache_root: Path) -> Dict[str, int]:
     state_path = cache_root / ".data_juicer_cache_quota.json"
     references = 0
@@ -499,10 +703,26 @@ def wait_for_zero_cache(
         time.sleep(1)
 
 
+def remove_legacy_cache_entries(cache_root: Path) -> None:
+    """Remove pre-window cache state while retaining resumable window dirs."""
+    if not cache_root.is_dir():
+        return
+    for child in cache_root.iterdir():
+        if child.is_dir() and child.name.startswith("window-"):
+            continue
+        if child.is_symlink():
+            raise ValueError(f"refusing to remove cache symlink: {child}")
+        if child.is_dir():
+            safe_rmtree(child, cache_root)
+        elif child.is_file():
+            child.unlink()
+
+
 def valid_success_marker(
     shard_dir: Path,
     mode: str,
     shard: Dict[str, Any],
+    execution_window_size: int = 0,
 ) -> bool:
     marker_path = shard_dir / "SUCCESS"
     data_path = shard_dir / "data.jsonl"
@@ -519,6 +739,8 @@ def valid_success_marker(
         and marker.get("logical_shard_index") == shard["logical_index"]
         and marker.get("input_rows") == shard["rows"]
         and marker.get("input_sha256") == shard["sha256"]
+        and marker.get("execution_window_size", 0)
+        == execution_window_size
     )
 
 
@@ -549,12 +771,18 @@ def write_logical_success(
     mode: str,
     logical_index: int,
     logical_shards: Sequence[Dict[str, Any]],
+    execution_window_size: int = 0,
 ) -> bool:
     logical_dir = output_root / f"shard-{logical_index:06d}"
     markers = []
     for shard in logical_shards:
         micro_dir = logical_dir / f"micro-{shard['micro_index']:04d}"
-        if not valid_success_marker(micro_dir, mode, shard):
+        if not valid_success_marker(
+            micro_dir,
+            mode,
+            shard,
+            execution_window_size,
+        ):
             return False
         markers.append(load_json(micro_dir / "SUCCESS"))
     atomic_write_json(
@@ -573,7 +801,7 @@ def write_logical_success(
 
 
 def validate_cli_ownership(argv: Sequence[str]) -> None:
-    for reserved in ("--output",):
+    for reserved in ("--output", "--disable-cache-quota"):
         if any(
             token == reserved or token.startswith(f"{reserved}=")
             for token in argv
@@ -640,6 +868,15 @@ def main() -> None:
         type=non_negative_int,
         default=60,
     )
+    parser.add_argument(
+        "--execution-window-size",
+        type=non_negative_int,
+        default=0,
+        help=(
+            "Split each micro-shard into resumable bounded execution "
+            "windows. Supported for fused mode; zero disables windowing."
+        ),
+    )
     parser.add_argument("--rebuild-input-shards", action="store_true")
     args, pipeline_args = parser.parse_known_args()
     validate_cli_ownership(raw_argv)
@@ -666,6 +903,12 @@ def main() -> None:
         parser.error(
             "--logical-shard-size must be an exact multiple of "
             "--micro-shard-size"
+        )
+    if args.execution_window_size and args.mode != "fused":
+        parser.error("--execution-window-size is supported only in fused mode")
+    if args.execution_window_size > args.micro_shard_size:
+        parser.error(
+            "--execution-window-size must not exceed --micro-shard-size"
         )
     generated_roots = (output_root, cache_root, work_root)
     unsafe_roots = {Path("/"), Path.home().resolve()}
@@ -694,6 +937,9 @@ def main() -> None:
     attempts_root.mkdir(parents=True, exist_ok=True)
     failures_root = work_root / "failures"
     failures_root.mkdir(parents=True, exist_ok=True)
+    window_checkpoints_root = work_root / "window_checkpoints"
+    if args.execution_window_size:
+        window_checkpoints_root.mkdir(parents=True, exist_ok=True)
 
     source_files = discover_source_files(input_path)
     fingerprint, source_entries = source_fingerprint(source_files)
@@ -708,6 +954,10 @@ def main() -> None:
         args.rebuild_input_shards,
     )
     if args.rebuild_input_shards:
+        if window_checkpoints_root.exists():
+            safe_rmtree(window_checkpoints_root, work_root)
+            if args.execution_window_size:
+                window_checkpoints_root.mkdir(parents=True)
         for stale_output in output_root.glob("shard-*"):
             if stale_output.is_dir():
                 safe_rmtree(stale_output, output_root)
@@ -741,6 +991,7 @@ def main() -> None:
                 logical_dir / f"micro-{shard['micro_index']:04d}",
                 args.mode,
                 shard,
+                args.execution_window_size,
             )
             for shard in logical_shards
         ):
@@ -762,7 +1013,12 @@ def main() -> None:
             f"{logical_name}-micro-{micro_index:04d}"
         )
         failure_path = failures_root / failure_name
-        if valid_success_marker(final_dir, args.mode, shard):
+        if valid_success_marker(
+            final_dir,
+            args.mode,
+            shard,
+            args.execution_window_size,
+        ):
             print(f"[skip] {task_name}: valid SUCCESS", flush=True)
             skipped += 1
             continue
@@ -783,34 +1039,152 @@ def main() -> None:
         normalized_output = attempt_dir / "data.jsonl"
         shard_cache = cache_root / logical_name / micro_name
         shard_cache.mkdir(parents=True, exist_ok=True)
+        window_root = (
+            window_checkpoints_root / logical_name / micro_name
+            if args.execution_window_size
+            else None
+        )
         expected_rows = expected_output_rows(
             args.mode,
             Path(shard["path"]),
             shard["rows"],
             pipeline_args,
         )
-        command = [
-            str(python),
-            str(pipeline_script),
-            "--input",
-            shard["path"],
-            "--output",
-            str(raw_output),
-            "--cache-root",
-            str(shard_cache),
-            *pipeline_args,
-        ]
         print(
             f"[run] {task_name}: input_rows={shard['rows']} "
-            f"expected_output_rows={expected_rows}",
+            f"expected_output_rows={expected_rows} "
+            f"execution_window_size={args.execution_window_size}",
             flush=True,
         )
         try:
-            subprocess.run(command, cwd=REPOSITORY, check=True)
-            output_rows, output_sha256 = normalize_output(
-                raw_output,
-                normalized_output,
-            )
+            windows: List[Dict[str, Any]] = []
+            if window_root is not None:
+                remove_legacy_cache_entries(shard_cache)
+                windows = build_execution_windows(
+                    Path(shard["path"]),
+                    shard["rows"],
+                    shard["sha256"],
+                    args.execution_window_size,
+                    window_root,
+                    window_checkpoints_root,
+                )
+                for window in windows:
+                    window_index = window["index"]
+                    window_name = f"window-{window_index:04d}"
+                    window_dir = window_root / window_name
+                    if valid_window_success(
+                        window_dir,
+                        args.mode,
+                        window,
+                    ):
+                        print(
+                            f"[window-skip] {task_name}/{window_name}: "
+                            "valid WINDOW_SUCCESS",
+                            flush=True,
+                        )
+                        continue
+                    (window_dir / "WINDOW_SUCCESS").unlink(
+                        missing_ok=True
+                    )
+                    (window_dir / "data.jsonl").unlink(missing_ok=True)
+                    for stale_raw in window_dir.glob(".ray-output-*"):
+                        if stale_raw.is_dir():
+                            safe_rmtree(stale_raw, window_dir)
+                        else:
+                            stale_raw.unlink()
+
+                    window_cache = shard_cache / window_name
+                    window_cache.mkdir(parents=True, exist_ok=True)
+                    window_raw_output = (
+                        window_dir
+                        / f".ray-output-{os.getpid()}-{uuid.uuid4().hex}"
+                    )
+                    command = [
+                        str(python),
+                        str(pipeline_script),
+                        "--input",
+                        window["input_path"],
+                        "--output",
+                        str(window_raw_output),
+                        "--cache-root",
+                        str(window_cache),
+                        "--disable-cache-quota",
+                        *pipeline_args,
+                    ]
+                    print(
+                        f"[window-run] {task_name}/{window_name}: "
+                        f"rows={window['input_rows']}",
+                        flush=True,
+                    )
+                    subprocess.run(
+                        command,
+                        cwd=REPOSITORY,
+                        check=True,
+                    )
+                    window_rows, window_sha256 = normalize_output(
+                        window_raw_output,
+                        window_dir / "data.jsonl",
+                    )
+                    if window_rows != window["input_rows"]:
+                        raise RuntimeError(
+                            f"window output row mismatch for "
+                            f"{task_name}/{window_name}: "
+                            f"expected={window['input_rows']}, "
+                            f"observed={window_rows}"
+                        )
+                    window_usage = wait_for_zero_cache(
+                        window_cache,
+                        args.cache_zero_timeout,
+                    )
+                    if window_raw_output.is_dir():
+                        safe_rmtree(window_raw_output, window_dir)
+                    elif window_raw_output.exists():
+                        window_raw_output.unlink()
+                    if window_cache.exists():
+                        safe_rmtree(window_cache, shard_cache)
+                    atomic_write_json(
+                        window_dir / "WINDOW_SUCCESS",
+                        {
+                            "version": 1,
+                            "mode": args.mode,
+                            "window_index": window_index,
+                            "input_rows": window["input_rows"],
+                            "input_sha256": window["input_sha256"],
+                            "output_rows": window_rows,
+                            "output_sha256": window_sha256,
+                            "cache": window_usage,
+                            "completed_at": datetime.now(
+                                timezone.utc
+                            ).isoformat(),
+                        },
+                    )
+                    print(
+                        f"[window-done] {task_name}/{window_name}: "
+                        f"{window_rows} rows",
+                        flush=True,
+                    )
+                output_rows, output_sha256 = merge_window_outputs(
+                    windows,
+                    window_root,
+                    normalized_output,
+                )
+            else:
+                command = [
+                    str(python),
+                    str(pipeline_script),
+                    "--input",
+                    shard["path"],
+                    "--output",
+                    str(raw_output),
+                    "--cache-root",
+                    str(shard_cache),
+                    *pipeline_args,
+                ]
+                subprocess.run(command, cwd=REPOSITORY, check=True)
+                output_rows, output_sha256 = normalize_output(
+                    raw_output,
+                    normalized_output,
+                )
             if output_rows != expected_rows:
                 raise RuntimeError(
                     f"output row mismatch for {task_name}: "
@@ -839,10 +1213,14 @@ def main() -> None:
                 "expected_output_rows": expected_rows,
                 "output_rows": output_rows,
                 "output_sha256": output_sha256,
+                "execution_window_size": args.execution_window_size,
+                "execution_windows": len(windows),
                 "cache": usage,
                 "completed_at": datetime.now(timezone.utc).isoformat(),
             }
             atomic_write_json(final_dir / "SUCCESS", marker)
+            if window_root is not None and window_root.exists():
+                safe_rmtree(window_root, window_checkpoints_root)
             failure_path.unlink(missing_ok=True)
             completed += 1
             print(
@@ -877,6 +1255,7 @@ def main() -> None:
             args.mode,
             logical_index,
             logical_shards,
+            args.execution_window_size,
         ):
             logical_completed += 1
 

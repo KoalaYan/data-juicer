@@ -136,6 +136,40 @@ def snapshot(
         f"failure records: {len(failures)}"
         + (f" ({', '.join(failures[-3:])})" if failures else ""),
     ]
+    window_root = work_root / "window_checkpoints"
+    if window_root.is_dir():
+        window_manifests = list(
+            window_root.rglob("WINDOW_MANIFEST")
+        )
+        if logical_shard_index is not None:
+            logical_name = f"shard-{logical_shard_index:06d}"
+            window_manifests = [
+                path
+                for path in window_manifests
+                if logical_name in path.parts
+            ]
+        total_windows = 0
+        completed_windows = 0
+        next_window = None
+        for manifest_path in sorted(window_manifests):
+            manifest = load_json(manifest_path)
+            for window in manifest.get("windows") or []:
+                total_windows += 1
+                window_dir = (
+                    manifest_path.parent
+                    / f"window-{int(window['index']):04d}"
+                )
+                if (window_dir / "WINDOW_SUCCESS").is_file():
+                    completed_windows += 1
+                elif next_window is None:
+                    next_window = str(
+                        window_dir.relative_to(window_root)
+                    )
+        if total_windows:
+            lines.append(
+                f"execution windows: {completed_windows}/{total_windows}; "
+                f"next={next_window or 'none'}"
+            )
     if cache_root is not None:
         cache_files, cache_bytes = cache_usage(cache_root)
         lines.append(

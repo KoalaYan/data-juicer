@@ -81,6 +81,7 @@ echo "[run] logical_shard=100000 micro_shard=10000 index=0"
   --work-root "${WORK_ROOT}" \
   --logical-shard-size 100000 \
   --micro-shard-size 10000 \
+  --execution-window-size 500 \
   --logical-shard-index 0 \
   --download-workers 8 \
   --download-batch-size 8 \
